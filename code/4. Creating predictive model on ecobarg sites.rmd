@@ -1,0 +1,520 @@
+---
+Authors: Michael Joel Traurig, Kay Critchell
+Title: Creating predictive debris accumulation model for Coastal clean-up prioritisation with open-access, data-lean models informs better decisions
+Version: 0.9 (Submission of manuscript)
+---
+
+# Load libraries
+```{R}
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, windfetch, raster, sf, terra, gdistance, glmmTMB, tmap, MuMIn, tidyterra, lme4, MASS, effects, AER, ggpubr, vegan, viridis, cowplot, biscale, RColorBrewer, caret, pROC, boot)
+source("code/function script.r")
+```
+
+# 1. Load data
+```{R}
+site_data <- st_read("data/beaches_linked.gpkg")
+debris_data <- read.csv("outputs/debris_data_with_weights.csv") %>%
+               dplyr::select(!X)
+gravity_data <- read.csv("outputs/gravity_final.csv") %>%
+                filter(!site_name %in% c("Rattray, Grumbell, Grassy Islands", "Goat Island Beach, South Molle Island")) %>%
+                dplyr::select(site_name, gravity)
+exposure_data <- st_read("outputs/exposure_data.gpkg")
+```
+# 2. Sensitivity testing on gravity and exposure
+## 2.1 Examine gravity outliers
+```{R}
+# Combine data sets
+combined_data <- left_join(debris_data, gravity_data, by = c("Site" = "site_name"))
+combined_data <- left_join(combined_data, exposure_data, by = c("Site" = "Sites")) %>%
+st_as_sf()
+#checking for outliers
+outlier <- combined_data %>% group_by(Site) %>% summarise(gravity = first(gravity), exposure = first(site_exposure)) %>% ungroup()
+boxplot(outlier$gravity)$out %>% sort()
+min(boxplot(outlier$gravity)$out) # < 9.9
+boxplot(outlier$exposure)$out %>% sort()
+min(boxplot(outlier$exposure)$out)
+
+#examining outliers
+data_goutliers <- filter(combined_data, gravity > 9.9) #These are the gravity outliers
+#Gravity outliers are not removed as they are not error outliers but rather interesting data points.
+```
+
+## 2.2 Explore exposure outlier, and determine best fit for power of fetch length through model selection
+```{R}
+exposure_testing <- st_read("outputs/exposure_data_testing.gpkg")
+combined_data_test <- left_join(debris_data, gravity_data, by = c("Site" = "site_name"))
+combined_data_test <- left_join(combined_data_test, exposure_testing, by = c("Site" = "Sites")) %>%
+st_as_sf()
+exposure_vars <- names(combined_data_test)[7:20] %>% as.character() #Columns of different forms of exposure adjustments
+for(i in 1:length(exposure_vars)){
+  combined_data_test <- combined_data_test %>% mutate(!!exposure_vars[i] := scale(!!sym(exposure_vars[i]), center = TRUE, scale = TRUE))
+}
+combined_data_test <- combined_data_test %>% mutate(gravity = scale(gravity, center = TRUE, scale = TRUE))
+levels_order <- c("Does Not Disperse", "Limited Dispersion", "Encumbered Drift", "Very Mobile", "Unencumbered Drift")
+combined_data_test$floatiness <- factor(combined_data_test$floatiness, levels = levels_order)
+
+# models <- list()
+
+# for(i in 1:length(exposure_vars)){
+#   formula_str <- paste("Totals ~", exposure_vars[i], "+ floatiness + gravity + gravity*floatiness +", exposure_vars[i], "*floatiness + (1|Site) + (1|year)")
+#   model <- glmmTMB(as.formula(formula_str), offset = num_cleans, data = combined_data_test, family = nbinom2(link = "log"))
+#   models[[i]] <- model
+# }
+# results <- model.sel(models, rank = "AICc")
+# view(results) # Results showed that the model with a power transformation of 0.3 was the best fit. power of 0.4 or 0.2 were within 2aic but 0.3 makes the most sense (visualising the shape).
+
+#Testing out more refined best fit
+exposure_testing <- st_read("outputs/exposure_data_testing2.gpkg")
+combined_data_test <- left_join(debris_data, gravity_data, by = c("Site" = "site_name"))
+combined_data_test <- left_join(combined_data_test, exposure_testing, by = c("Site" = "Sites")) %>%
+st_as_sf()
+exposure_vars <- names(combined_data_test)[7:28] %>% as.character() #Columns of different forms of exposure adjustments
+for(i in 1:length(exposure_vars)){
+  combined_data_test <- combined_data_test %>% mutate(!!exposure_vars[i] := scale(!!sym(exposure_vars[i]), center = TRUE, scale = TRUE))
+}
+combined_data_test <- combined_data_test %>% mutate(gravity = scale(gravity, center = TRUE, scale = TRUE))
+levels_order <- c("Does Not Disperse", "Limited Dispersion", "Encumbered Drift", "Very Mobile", "Unencumbered Drift")
+combined_data_test$floatiness <- factor(combined_data_test$floatiness, levels = levels_order)
+
+# models <- list()
+
+# for(i in 1:length(exposure_vars)){
+#   formula_str <- paste("Totals ~", exposure_vars[i], "+ floatiness + gravity + gravity*floatiness +", exposure_vars[i], "*floatiness + (1|Site) + (1|year)")
+#   model <- glmmTMB(as.formula(formula_str), offset = num_cleans, data = combined_data_test, family = nbinom2(link = "log"))
+#   models[[i]] <- model
+# }
+# results <- model.sel(models, rank = "AICc")
+# view(results) # Results showed that the model with a power transformation of 0.3 was 0.01 of best fit (which was 0.31). Have kept the power level at 0.3 for the final model.
+```
+## 2.3 Complete data cleaning, and run correlation test bewteen gravity and exposure.
+```{R}
+data_complete <- combined_data_test %>% dplyr::select(1:6, pw_3_exposure, geom) %>% rename(site_exposure = pw_3_exposure)
+levels_order <- c("Does Not Disperse", "Limited Dispersion", "Encumbered Drift", "Very Mobile", "Unencumbered Drift")
+data_complete$floatiness <- factor(data_complete$floatiness, levels = levels_order)
+
+#Melt high and low disperal categories together
+data_reduced <- data_complete %>% mutate(floatiness = case_when(floatiness %in% c("Does Not Disperse", "Limited Dispersion") ~ "Low dispersal capacity",
+                                                                floatiness %in% c("Encumbered Drift", "Very Mobile", "Unencumbered Drift") ~ "High dispersal capacity"))
+data_reduced <- data_reduced %>% group_by(Site, year, num_cleans, gravity, site_exposure, floatiness, geom) %>%
+                summarize(Totals = sum(Totals))
+levels_order <- c("Low dispersal capacity", "High dispersal capacity")
+data_reduced$floatiness <- factor(data_reduced$floatiness, levels = levels_order)
+#st_write(data_reduced, "outputs/clean_up_sites.gpkg")
+#Correlation test results
+forcortest <- data_complete %>% group_by(Site) %>%
+              summarize(gravity = first(gravity), exposure = first(site_exposure)) %>%
+              ungroup()
+cor.test(forcortest$gravity, forcortest$exposure)
+#Significant correlation, correlation -.21
+
+# Saving parameters for scaling
+parameters <- list()
+ parameters[1] <- attr(data_reduced$site_exposure, "scaled:center")
+ parameters[2] <- attr(data_reduced$site_exposure, "scaled:scale")
+ parameters[3] <- attr(data_reduced$gravity, "scaled:center")
+ parameters[4] <- attr(data_reduced$gravity, "scaled:scale")
+names(parameters) <- c("site_exposure_center", "site_exposure_scale", "gravity_center", "gravity_scale")
+saveRDS(parameters, "outputs/scaling_parameters.rds")
+```
+
+# 3. Produce violin plots for each floatiness category of debris data
+```{R}
+#Violin plots
+cols <- brewer.pal(9, "RdYlGn")
+cols[6] <- "#8B4513"
+
+# Filter data for the first four categories
+data_first_four <- data_complete %>% 
+  filter(floatiness != "Unencumbered Drift")
+
+# Filter data for the fifth category
+data_fifth <- data_complete %>% 
+  filter(floatiness == "Unencumbered Drift")
+
+# Plot for the first four categories
+plot_first_four <- ggplot(data_first_four, aes(x = floatiness, y = Totals, colour = floatiness)) +
+  geom_violin() +
+  geom_boxplot(width = 0.05) +
+  geom_point(data = data_first_four %>% group_by(floatiness) %>% summarize(mean_value = mean(Totals)), aes(x = floatiness, y = mean_value), shape = "square", color = "black", size = 2.5) +
+  geom_hline(yintercept = 5000, color = "blue", linetype = "dotted") +
+  labs(x = "\n\n\nDispersal Capacity", y = "Count of Debris") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 11.5),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 12),
+        panel.grid.minor = element_blank(),  # Remove minor grid lines
+        panel.background = element_blank()) +  # Remove panel background) +
+  scale_color_manual(values = cols[c(9,7,3,6)])
+
+# Plot for the fifth category
+plot_fifth <- ggplot(data_fifth, aes(x = floatiness, y = Totals, colour = floatiness)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  geom_point(data = data_fifth %>% group_by(floatiness) %>% summarize(mean_value = mean(Totals)), aes(x = floatiness, y = mean_value), shape = "square", color = "black", size = 2.5) +
+  geom_hline(yintercept = 5000, color = "blue", linetype = "dotted") +
+  labs(x = "\n\n\n", y = "Count of Debris") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 11.5),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 12),
+        panel.grid.minor = element_blank(),  # Remove minor grid lines
+        panel.background = element_blank()) +  # Remove panel background
+  scale_color_manual(values = cols[1])
+
+# Combine the plots
+ggarrange(plot_first_four, plot_fifth, ncol = 2, nrow = 1, labels = c("A", "B"), widths = c(4,1))
+ggsave("plots/violin_plot_split.png", width = 10, height = 7, units = "in")
+```
+
+# 4. Create predictive models
+## 4.1 Fit models
+```{R}
+#Tried poisson distribution, but overdispersion was present so switched to negative binomial
+
+#Full model results (all categories)
+#Generate the model
+model_complete <- glmmTMB(Totals ~ gravity + site_exposure + floatiness + gravity*floatiness + site_exposure*floatiness + (1|Site) + (1|year),
+                                   offset = num_cleans,
+                                   data = data_complete,
+                                   family = nbinom2(link = "log"))
+#check for overdispersion
+deviance(model_complete) / df.residual(model_complete) # > 1
+car::Anova(model_complete, type = "III")
+summary(model_complete)
+saveRDS(model_complete, "outputs/full_model.rds")
+#write.csv(as.data.frame(summary(model_complete)[[6]][[1]]), "outputs/full_model_results(exposure power 0.3).csv")
+
+#Perform model selection
+  # options(na.action = "na.fail")
+  # mod_sel <- dredge(model_complete, trace = TRUE, rank = "AICc")
+  # print(mod_sel)
+  # write.csv(as.data.frame(mod_sel), "outputs/model_selection(no_adjustments)_results.csv")
+
+model_melted <- glmmTMB(Totals ~ gravity + site_exposure + floatiness + gravity*floatiness + site_exposure*floatiness + (1|Site) + (1|year),
+                        offset = num_cleans,
+                        data = data_reduced,
+                        family = nbinom2(link = "log"))
+#check for overdispersion
+deviance(model_melted) / df.residual(model_melted) # > 1
+car::Anova(model_melted, type = "III")
+summary(model_melted)
+saveRDS(model_melted, "outputs/melted_model.rds")
+write.csv(as.data.frame(summary(model_melted)[[6]][[1]]), "outputs/melted_model_results.csv")
+  options(na.action = "na.fail")
+  mod_sel <- dredge(model_melted, trace = TRUE, rank = "AICc")
+  print(mod_sel)
+  write.csv(as.data.frame(mod_sel), "outputs/model_selection(melted)_results.csv")
+```
+# 4.2 Test model robustness through k fold cross validation
+```{R}
+fit_model <- function(train_data) {
+  glmmTMB(
+    Totals ~ gravity + site_exposure + floatiness + gravity*floatiness + site_exposure*floatiness + (1|Site) + (1|year),
+    offset = num_cleans,
+    data = train_data,
+    family = nbinom2(link = "log")
+  )
+}
+
+#Perform K-fold cross validation
+perform_kfold = function(k, data){
+folds <- createFolds(data$Totals, k = k, list = TRUE, returnTrain = TRUE)
+auc_values <- c()
+  for (i in 1:k) {
+    train_indices <- folds[[i]]
+    test_indices <- setdiff(1:nrow(data_reduced), train_indices)
+  
+    train_data <- data_reduced[train_indices, ]
+    test_data <- data_reduced[test_indices, ]
+  
+    model <- fit_model(train_data)
+  
+    # Predict on test data
+    predicted_probs <- predict(model, newdata = test_data, type = "response")
+    actual <- test_data$Totals
+  
+    # Calculate AUC
+    roc_curve <- multiclass.roc(actual, predicted_probs)
+    auc_value <- auc(roc_curve)
+    auc_values <- c(auc_values, auc_value)
+  }
+  return(auc_values)
+}
+#For K = 5
+set.seed(123)  # For reproducibility
+auc_values <- perform_kfold(5, data_reduced)
+mean_auc <- mean(auc_values)
+print(mean_auc) #0.9974931
+
+#For K = 10
+set.seed(123)  # For reproducibility
+auc_values <- perform_kfold(10, data_reduced)
+mean_auc <- mean(auc_values)
+print(mean_auc) #0.9992113
+#For K = 30
+set.seed(123)  # For reproducibility
+auc_values <- perform_kfold(30, data_reduced)
+mean_auc <- mean(auc_values)
+print(mean_auc) #0.9992063
+
+#Leave one out cross validation
+set.seed(123)  # For reproducibility
+n <- nrow(data_reduced)  # Number of observations
+all_actual <- c()
+all_predicted_probs <- c()
+
+for (i in 1:n) {
+  test_indices <- i
+  train_indices <- setdiff(1:n, test_indices)
+  
+  train_data <- data_reduced[train_indices, ]
+  test_data <- data_reduced[test_indices, ]
+  
+  model <- fit_model(train_data)
+  
+  # Predict on test data
+  predicted_probs <- predict(model, newdata = test_data, type = "response")
+  actual <- test_data$Totals
+  
+  # Accumulate actual and predicted probabilities
+  all_actual <- c(all_actual, actual)
+  all_predicted_probs <- c(all_predicted_probs, predicted_probs)
+}
+# Calculate AUC for multiclass
+roc_curve <- multiclass.roc(all_actual, all_predicted_probs)
+mean_auc <- auc(roc_curve)
+print(mean_auc) #0.9861
+
+# roc_list <- roc_curve$rocs
+# roc_plot_data <- data.frame()
+# for (i in 1:length(roc_list)) {
+#   roc_data <- roc_list[[i]]
+#   roc_df <- data.frame(
+#     tpr = rev(roc_data$sensitivities),
+#     fpr = rev(roc_data$specificities),
+#     class = as.factor(i)
+#   )
+#   roc_plot_data <- rbind(roc_plot_data, roc_df)
+# }
+# saveRDS(roc_plot_data, "outputs/roc_plot_data.rds")
+
+```
+# 4.3 Plot model results
+```{R}
+cols <- brewer.pal(9, "RdYlGn")
+cols[6] <- "#8B4513"
+
+#Complete model
+exp_plot <- plot_overall(model = model_complete,
+             variable = "site_exposure",
+             xlab = "Exposure (scaled)",
+             ylab = "",
+             title = "",
+             limits = c(0,500),
+             logged = FALSE) +
+             annotate("text", x = 1, y = 500, label = "*", size = 20)
+grav_plot <- plot_overall(model = model_complete,
+              variable = "gravity",
+              xlab = "Gravity (scaled)",
+              ylab = "Fitted debris",
+              title = "",
+              limits = c(0,500),
+              logged = FALSE)
+ggarrange(grav_plot, exp_plot)
+ggsave("plots/exposure_gravity_effects (complete model).png", width = 10, height = 5, units = "in")
+
+exp_plot <- plot_overall(model = model_melted,
+             variable = "site_exposure",
+             xlab = "Exposure (scaled)",
+             ylab = "",
+             title = "",
+             limits = c(0,2000),
+             logged = FALSE) #+
+#             annotate("text", x = 0.9, y = 600, label = "*", size = 20)
+grav_plot <- plot_overall(model = model_melted,
+              variable = "gravity",
+              xlab = "Gravity (scaled)",
+              ylab = "Fitted debris",
+              title = "",
+              limits = c(0,2000),
+              logged = FALSE)
+ggarrange(grav_plot, exp_plot)
+ggsave("plots/exposure_gravity_effects (melted model).png", width = 10, height = 5, units = "in")
+
+exp_nolog <- plot_interaction(model = model_melted,
+                variable = "site_exposure",
+                xlab = "Exposure (scaled)",
+                ylab = "",
+                title = "",
+                limits = c(0,12000),
+                logged = FALSE,
+                floatiness = "") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(7,6)])
+grav_nolog <- plot_interaction(model = model_melted,
+                variable = "gravity",
+                xlab = "Gravity (scaled)",
+                ylab = "Fitted debris",
+                title = "",
+                limits = c(0,12000),
+                logged = FALSE,
+                floatiness = "") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(7,6)])
+ggarrange(grav_nolog, exp_nolog, ncol = 2, nrow = 1, common.legend = TRUE, legend = "bottom", labels = c("A", "B")) 
+ggsave("plots/exposure_gravity_interactions (melted model).png", width = 10, height = 5, units = "in")
+
+exp_nolog <- plot_interaction(model = model_complete,
+                variable = "site_exposure",
+                xlab = "Exposure (scaled)",
+                ylab = "",
+                title = "",
+                limits = c(0,10000),
+                logged = FALSE,
+                floatiness = "Unencumbered drift") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(9,7,3,6,1)])
+exp_log <- plot_interaction(model = model_complete,
+                variable = "site_exposure",
+                xlab = "Exposure (scaled)",
+                ylab = "",
+                title = "",
+                limits = c(0,2000),
+                logged = FALSE,
+                floatiness = "other") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(9,7,3,6)])
+grav_nolog <- plot_interaction(model = model_complete,
+                variable = "gravity",
+                xlab = "Gravity (scaled)",
+                ylab = "Fitted debris",
+                title = "",
+                limits = c(0,10000),
+                logged = FALSE,
+                floatiness = "Unencumbered drift") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(9,7,3,6,1)])
+grav_log <- plot_interaction(model = model_complete,
+                variable = "gravity",
+                xlab = "Gravity (scaled)",
+                ylab = "Fitted debris",
+                title = "",
+                limits = c(0,2000),
+                logged = FALSE,
+                floatiness = "other") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(9,7,3,6)])
+ggarrange(grav_nolog, exp_nolog, grav_log, exp_log, ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom", labels = c("A1", "B1", "A2", "B2")) %>%
+annotate_figure(bottom = text_grob("Dispersal Capacity", face = "bold", size = 12))
+ggsave("plots/exposure_gravity_interactions (complete model).png", width = 10, height = 10, units = "in")
+
+```
+
+# 4.4 Alternative model (seperate models)
+```{R}
+data_high_disp <- data_complete %>%
+                  filter(floatiness %in% c("Encumbered Drift", "Unencumbered Drift", "Very Mobile")) %>%
+                  group_by(Site, year, floatiness) %>%
+                  summarize(exposure = first(site_exposure), gravity = first(gravity), Totals = sum(Totals), num_cleans = first(num_cleans)) %>%
+                  ungroup()
+data_low_disp <- data_complete %>%
+                 filter(floatiness %in% c("Does Not Disperse", "Limited Dispersion")) %>%
+                  group_by(Site, year, floatiness) %>%
+                  summarize(gravity = first(gravity), exposure = first(site_exposure), Totals = sum(Totals), num_cleans = first(num_cleans)) %>%
+                  ungroup()
+Cmodel_lowdis_cmp <- glmmTMB(Totals ~ gravity *floatiness + exposure*floatiness + (1|Site) + (1|year), offset = num_cleans, data = data_low_disp, family = nbinom2(link = "log"))
+Cmodel_highdis_cmp <- glmmTMB(Totals ~   exposure * floatiness + gravity*floatiness+ (1|Site) + (1|year), offset = num_cleans, data = data_high_disp, family = nbinom2(link = "log"))
+car::Anova(Cmodel_lowdis_cmp)
+car::Anova(Cmodel_highdis_cmp)
+summary(Cmodel_lowdis_cmp)
+summary(Cmodel_highdis_cmp)
+
+grav_plot <- plot_overall(model = Cmodel_lowdis_cmp,
+             variable = "gravity",
+             xlab = "Gravity (Scaled)",
+             ylab = "Fitted debris",
+             title = "A",
+             limits = c(0,1000),
+             logged = FALSE) 
+exp_plot <- plot_overall(model = Cmodel_lowdis_cmp,
+             variable = "exposure",
+             xlab = "Exposure (Scaled)",
+             ylab = "",
+             title = "B",
+             limits = c(0,1000),
+             logged = FALSE)
+ggarrange(grav_plot, exp_plot)
+ggsave("plots/exposure_gravity_effects (low dispersal model).png", width = 10, height = 5, units = "in")
+
+grav_plot <- plot_overall(model = Cmodel_highdis_cmp,
+             variable = "gravity",
+             xlab = "Gravity (Scaled)",
+             ylab = "Fitted debris",
+             title = "C",
+             limits = c(0,2000),
+             logged = FALSE)
+exp_plot <- plot_overall(model = Cmodel_highdis_cmp,
+             variable = "exposure",
+             xlab = "Exposure (Scaled)",
+             ylab = "",
+             title = "D",
+             limits = c(0,2000),
+             logged = FALSE)
+ggarrange(grav_plot, exp_plot)
+ggsave("plots/exposure_gravity_effects (high dispersal model).png", width = 10, height = 5, units = "in")
+
+cols <- brewer.pal(9, "RdYlGn")
+cols[6] <- "#8B4513"
+low_grav_plot <- plot_interaction(model = Cmodel_lowdis_cmp,
+                variable = "gravity",
+                xlab = "Gravity (Scaled)",
+                ylab = "Fitted debris",
+                title = "",
+                limits = c(0,2000),
+                logged = FALSE,
+                floatiness = "") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(9,7)])
+low_exp_plot <- plot_interaction(model = Cmodel_lowdis_cmp,
+                variable = "exposure",
+                xlab = "Exposure (Scaled)",
+                ylab = "Fitted debris",
+                title = "",
+                limits = c(0,2000),
+                logged = FALSE,
+                floatiness = "") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(9,7)])
+high_grav_plot <- plot_interaction(model = Cmodel_highdis_cmp,
+                variable = "gravity",
+                xlab = "Gravity (Scaled)",
+                ylab = "Fitted debris",
+                title = "",
+                limits = c(0,12000),
+                logged = FALSE,
+                floatiness = "Unencumbered drift") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(3,6,1)])
+high_exp_plot <- plot_interaction(model = Cmodel_highdis_cmp,
+                variable = "exposure",
+                xlab = "Exposure (Scaled)",
+                ylab = "Fitted debris",
+                title = "",
+                limits = c(0,12000),
+                logged = FALSE,
+                floatiness = "Unencumbered drift") +
+  labs(color = "") +
+  scale_color_manual(values = cols[c(3,6,1)])
+
+p1 <- ggarrange(low_grav_plot, low_exp_plot, ncol =2, common.legend = TRUE, legend = "bottom", labels = c("A", "B")) %>%
+annotate_figure(bottom = text_grob("Dispersal Capacity", face = "bold", size = 12))
+p2 <- ggarrange(high_grav_plot, high_exp_plot, ncol = 2, common.legend = TRUE, legend = "bottom", labels = c("C", "D")) %>%
+annotate_figure(bottom = text_grob("Dispersal Capacity", face = "bold", size = 12))
+ggarrange(p1, p2, ncol = 1, nrow = 2)
+ggsave("plots/exposure_gravity_interactions (seperate models).png", width = 10, height = 10, units = "in")
+```

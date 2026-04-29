@@ -1,0 +1,374 @@
+---
+Authors: Michael Joel Traurig, Kay Critchell
+Title: Applying predictive model across Whitsundsays region for Coastal clean-up prioritisation with open-access, data-lean models informs better decisions
+Version: 0.9 (Submission of manuscript)
+---
+
+# 1. Load libraries and functions
+```{R}
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, windfetch, raster, sf, terra, gdistance, glmmTMB, tmap, MuMIn, tidyterra, lme4, MASS, effects, AER, ggpubr, vegan, viridis, cowplot, biscale, RColorBrewer, caret, pROC, boot)
+source("code/function script.r")
+```
+Here we create points along the coastline and islands to calculate gravity and exposure and then predict debris deposition across the coastline. We then use these predictions to assess the current prioritisation of clean ups, and identify high priority sites for future clean ups.
+# 2. Model coastline
+```{R}
+e <- ext(148.00916, 149.34895, -21.34380, -19.90391)
+coastline <- vect("data/coast_nobuff.shp") %>% crop(e) %>% project(exposure_data) %>% st_as_sf()
+
+point_distance <- 500
+create_regular_points <- function(line, distance) {
+  line_length <- as.numeric(st_length(line))
+  n_points <- floor(line_length / distance)
+  points <- st_line_sample(line, sample = seq(0, 1, length.out = n_points + 1))
+  points_sf <- st_sf(geometry = points)
+  return(points_sf)
+}
+points_list <- lapply(st_geometry(coastline), create_regular_points, distance = point_distance)
+all_points_sf <- do.call(rbind, points_list)
+all_points_sf$id <- seq_len(nrow(all_points_sf))
+st_crs(all_points_sf) <- st_crs(coastline)
+st_cast(all_points_sf, "POINT") %>% mutate(Travel_type = "Ocean") %>%
+st_write("outputs/regular_points_single.gpkg")
+#Sites that were deemed to be inland or riverine were manually removed manually in ARCpro (comparing to satelite imaging).
+```
+
+# 3. Apply gravity to coastline
+```{R}
+e <- raster::extent(148.00916, 149.34895, -21.34380, -19.90391)
+pop_raster  		<- rast("data/population_aus_northeast_2018-10-01.tif") %>%
+                       crop(e) %>%
+                       project("+proj=utm +zone=55 +south +ellps=WGS84 +datum=WGS84 +units=m +no_defs")#population density grid cells
+site_points <- st_read("outputs/regular_points_single.gpkg") %>% st_transform(crs = st_crs(pop_raster)) %>%
+                mutate(id = row_number())
+#Queensland roads layer had roads on islands removed as they would adjust island sites to be non-ocean travel
+queensland_roads 	<- st_read("data/queensland_roads_adjusted.gpkg") %>%
+                       st_crop(e) %>%
+					   filter(CLASS != "Ferry") %>%
+					   st_transform(crs = st_crs(pop_raster)) %>%
+					   st_as_sf()
+bathy				<- rast("data/3_ausseabed_Great_Barrier_Reef_C_2020_30m_OV.tif") %>%
+					   crop(e) %>%
+					   project("+proj=utm +zone=55 +south +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+ports       		<- st_read("data/ports.gpkg") %>%
+					   st_transform(crs = st_crs(pop_raster)) %>%
+					   st_crop(bathy) %>%
+					   filter(FACILITY == "Boat Ramp") %>%
+					   filter(!NAME %in% c("Peter Faust Dam via Proserpine",
+					   					   "Murray Creek, Landing Road",
+										   "Mount Jukes, Howell's Road (Constant Creek)",
+										   "Pleystowe",
+										   "Kinchant Dam, Kinchant Dam Road",
+										   "Teemburra Dam, Lucas Paddock Road",
+										   "Eungella Dam, Eungella Dam Road",
+										   "Andergrove, Apsley Way",
+										   "Mackay, River Street",
+										   "Dunnrock, Dunrock Esplanade",
+										   "Proserpine River, Conway Road")) %>%
+					   dplyr::select(NAME) %>%
+					   rename(Site = "NAME") %>%
+					   rename(geometry = "Shape")
+border_poly 		<- st_read("data/Australia_Polygon.shp") %>%
+                       filter(name == "Queensland") %>%
+					   st_crop(e) %>%
+					   st_transform(crs = st_crs(pop_raster))
+
+ocean_presence <- bathy
+ocean_presence[ocean_presence >= 3] <- NA
+ocean_presence[ocean_presence < 3] <- 1
+ocean_presence <- mask(ocean_presence, border_poly, inverse = TRUE, touches = TRUE)
+# Move beach and port points to nearest ocean cell
+beach_points_moved <- move_points_to_ocean(site_points, ocean_presence, sitedata = "id")
+port_points_moved <- move_points_to_ocean(ports, ocean_presence, sitedata = "Site")
+beach_points_moved <- beach_points_moved %>% rename(Site = "id")
+beaches_linked <- find_nearest_port(beach_points_moved, port_points_moved)
+beaches_linked <- beaches_linked %>% mutate(Site = row_number())
+
+# Calculate the distance from each point to the nearest road to determine travel type
+distances <- st_distance(beaches_linked, queensland_roads)
+min_distances <- apply(distances, 1, min)
+beaches_linked <- beaches_linked %>% 
+  mutate(Travel_type = ifelse(min_distances < 300, "Land", "Ocean"))
+#calculate ocean_travel
+ocean <- mask(bathy, border_poly, inverse = TRUE, touches = TRUE) %>%
+         crop(st_buffer(beaches_linked, 5000))
+ocean_trans <- get_ocean_transition(ocean, 10)
+beaches_linked$ocean_trav <- 0
+for(i in 1:nrow(beaches_linked)){
+  if(beaches_linked$Travel_type[i] == "Ocean"){
+  beaches_linked[i, ]$ocean_trav <- get_ocean_travel(origin = beaches_linked[i, ],
+				 destination = port_points_moved,
+				 transition = ocean_trans,
+				 output = "distance")
+  }
+message("processed ", i, " of ", nrow(beaches_linked))
+}
+
+#Assigning beaches which have no ocean travel to calculated land distance from itself not nearest port
+beaches_noocean <- filter(beaches_linked, Travel_type == "Land")$Site
+beaches_linked$nearest_port <- ifelse(beaches_linked$Site %in% beaches_noocean, beaches_linked$Site, beaches_linked$nearest_port)
+st_write(beaches_linked, "data/beaches_linked_coastpoints.gpkg")
+###Here we manually checked the points to remove any additional locations that needed to be removed.
+beaches_linked <- st_read("data/beaches_linked_coastpoints.gpkg")
+#1. Remove duplicated points (where the auto generation made two points for the same location).
+beaches_linked$geometry_wkt <- st_as_text(beaches_linked$geom)
+beaches_linked <- beaches_linked[!duplicated(beaches_linked$geometry_wkt), ]
+beaches_linked <- dplyr::select(beaches_linked, !geometry_wkt)
+#2. Remove points that are within river systems, or not coastal
+beaches_linked <- beaches_linked %>% filter(!Site %in% c(1812, 1842, 2114, 2426:2430, 2685:2699))
+st_write(beaches_linked, "data/beaches_linked_coastpoints_adjusted.gpkg")
+#Adding sites with no ocean travel as ports to calculate land travel
+beaches_noport <- filter(beaches_linked, Site %in% beaches_noocean) %>% rename(geometry = "geom") %>% dplyr::select(Site, geometry)
+st_write(rbind(beaches_noport, port_points_moved), "data/port_points_moved_coastpoints.gpkg")
+
+#Calculate land travel for each port
+beaches_linked <- st_read("data/beaches_linked_coastpoints_adjusted.gpkg")
+port_points_moved <- st_read("data/port_points_moved_coastpoints.gpkg")
+ports_reduced <- port_points_moved %>%
+				 filter(Site %in% beaches_linked$nearest_port) %>% vect()
+
+rasters <- list()
+for (i in 1:nrow(ports_reduced)) {
+  # Generate a raster using 'get_land_distance'
+  r <- get_land_distance(population = pop_raster,
+                         origin = ports_reduced[i, ],
+                         structures = queensland_roads,
+                         decay_factor = 0.0001,
+                         land_mask = border_poly)
+  # Add the raster to the list
+  rasters[[i]] <- r
+}
+names(rasters) <- ports_reduced$Site
+write_rds(rasters, "outputs/ldcp_templist.rds")
+rasters <- read_RDS("C:/Users/traurigm/Desktop/ldcp_templist.rds")
+stack <- terra::rast(rasters)
+writeRaster(stack, "data/land_distance_stack_coastpoints.tif", overwrite = TRUE)
+
+df <- data.frame(site_name = beaches_linked$Site, 
+				 gravity = 0)
+land_distances <- rast("data/land_distance_stack_coastpoints.tif")
+
+#put it together
+pop_reclass <- terra::classify(pop_raster, rcl = matrix(c(NA, NA, 0), ncol = 3, byrow = TRUE), right = NA) %>%
+    mask(border_poly, touches = TRUE)
+for(i in 1:nrow(df)) {
+  df$gravity[i] <- calculate_gravity(study_site = beaches_linked[i,],
+                                     population = pop_raster,
+					                 land_distances = land_distances,
+					                 constant = 1)
+}
+write.csv(df, "outputs/gravity_coastpoints.csv")
+beaches_linked$gravity <- df$gravity
+st_write(beaches_linked, "outputs/beaches_coast_withgrav.gpkg")
+```
+
+# 4. Apply exposure to coastline
+```{R}
+#Apply exposure to coastline
+bathy				<- rast("data/3_ausseabed_Great_Barrier_Reef_C_2020_30m_OV.tif") %>%
+#					     crop(e) %>%
+					     project("+proj=utm +zone=55 +south +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+
+site_points <- st_read("outputs/beaches_coast_withgrav.gpkg")
+border_poly 		<- st_read("data/Australia_Polygon.shp") %>%
+                       filter(name == "Queensland") %>%
+#					   st_crop(e) %>%
+					   st_transform(crs = st_crs(bathy))
+
+#Removing points that were identified as being land rather than coastal (windfetch failed to capture fetch for these sites), manually checked in ARCpro using satellite imaging.
+site_points <- site_points %>% filter(!Site %in% c(12, 213, 274, 300, 424, 431, 499, 587, 588, 597, 625, 669, 670, 682, 684, 732, 863, 893, 896, 905, 917, 918,
+                                                         1007, 1021, 1031, 1039, 1041, 1043, 1102, 1112, 1116, 1312, 1313, 1436, 1458, 1500, 2015, 2060,
+                                                         2108, 2185, 2293, 2349, 2484, 2518, 2520, 2719, 2727, 2740, 2746))
+site_points <- site_points %>% filter(gravity < 53) # Max range of gravity from model was 52.1992
+bathy[bathy <= 5] <- NA
+bathy[bathy >= 5] <- 1
+obstacles <- st_union(st_as_sf(as.polygons(bathy)), st_geometry(border_poly))
+my_fetch <- windfetch(obstacles, site_points %>% dplyr::select("Site"), n_directions = 9, max_dist = 600)
+fetch_sf <- as_sf(my_fetch)
+sites <- data.frame(Sites = site_points$Site)
+for(i in 1:length(sites$Sites)){
+	sites$fetch_site[i] <- paste0("Site ", i)
+}
+#left join sites to my_fetch
+fetch_sf <- left_join(fetch_sf, sites, by = c("site_name" = "fetch_site"))
+#calculate the length of each linestring and add that length as a column
+st_write(fetch_sf, "outputs/fetch_coastal_36_final.gpkg")
+st_write(site_points, "outputs/gravity_coast_final.gpkg")
+```
+
+# 5. Calculate wind exposure for all coastal points and predict debris accumulation across coastline
+```{R}
+#Predict debris across coastline
+#Start with predicting a sample of locations
+beaches_linked <- st_read("outputs/gravity_coast_final.gpkg") # Max range of gravity from model was 52.1992
+beaches_linked$Site <- as.character(beaches_linked$Site) 
+beaches_exposed <- st_read("outputs/fetch_coastal_36_final.gpkg")
+wind_data <- read.csv("data/wind/HM01X_Data_033255_999999999512646.txt") %>%
+             filter(Wind.speed.in.km.h != 0) %>%
+			 mutate(Wind.direction.in.degrees.true = ifelse(Wind.direction.in.degrees.true == 360, 0, Wind.direction.in.degrees.true))
+wind_summarized <- wind_data %>%
+				   group_by(Wind.direction.in.degrees.true) %>%
+				   summarize(Wind.speed = mean(Wind.speed.in.km.h),
+				             frequency = n()/length(wind_data$Wind.direction.in.degrees.true))
+exposure_data <- left_join(beaches_exposed, wind_summarized, by = c("directions" = "Wind.direction.in.degrees.true")) %>% group_by(Sites, directions) %>%
+				 summarize(line_exposure = ((fetch^0.3)*Wind.speed*frequency)) %>%
+				 group_by(Sites) %>%
+				 summarize(site_exposure = sum(line_exposure))
+
+beaches_linked$exposure <- exposure_data$site_exposure
+coastaldata <- beaches_linked %>% filter(exposure < 959 & exposure > 85) #Max range of exposure (after power transformation) was 958.55076 and min range was 85.71388
+scaling_parameters <- readRDS("outputs/scaling_parameters.rds")
+coastaldata$gravity <- scale(coastaldata$gravity, center = scaling_parameters$gravity_center, scale = scaling_parameters$gravity_scale)
+coastaldata$exposure <- scale(coastaldata$exposure, center = scaling_parameters$site_exposure_center, scale = scaling_parameters$site_exposure_scale)
+
+#Predict debris
+complete_model <- readRDS("outputs/full_model.rds")
+melted_model <- readRDS("outputs/melted_model.rds")
+
+#Predict debris using the melted_model
+predict_high <- coastaldata %>% dplyr::select(Site, gravity, exposure, -geom) %>% as.data.frame() %>%  
+                mutate(floatiness = "High dispersal") %>%
+                rename(site_exposure = exposure) %>%
+                mutate(num_cleans = 1) %>%
+                mutate(year = "2022")
+predict_low <- coastaldata %>% dplyr::select(Site, gravity, exposure, -geom) %>% as.data.frame() %>%
+                mutate(floatiness = "Low dispersal") %>%
+                rename(site_exposure = exposure) %>%
+                mutate(num_cleans = 1) %>%
+                mutate(year = "2022")
+
+predictions_high <- predict(melted_model, newdata = predict_high, type = "response")
+predictions_low <- predict(melted_model, newdata = predict_low, type = "response")
+coastaldata$debris <- predictions_high + predictions_low
+st_write(coastaldata, "outputs/coastal_with_predicted_debris.gpkg")
+```
+# 6. Assessment of ecobarg cleanups
+Here we use the predicted debris values across the coastline to assess the current prioritisation of clean ups, and identify high priority sites for future clean ups. We do this in two ways, first by assigning each clean up to the nearest point on the coastline and using the predicted debris value for that point, and second by predicting debris values for the clean up sites themselves using their gravity and exposure values.
+```{R}
+coastaldata <- st_read("outputs/coastal_with_predicted_debris.gpkg")
+gravity_data <- read.csv("outputs/gravity_final.csv") %>%
+                filter(!site_name %in% c("Rattray, Grumbell, Grassy Islands", "Goat Island Beach, South Molle Island")) %>%
+                dplyr::select(site_name, gravity)
+exposure_data <- st_read("outputs/exposure_data_testing.gpkg") %>% dplyr::select(Sites, pw_3_exposure) %>% rename(site_exposure = pw_3_exposure) %>% st_drop_geometry()
+clean_ups <- left_join(exposure_data, gravity_data, by = c("Sites" = "site_name")) %>% rename(Site = Sites)
+scaling_parameters <- readRDS("outputs/scaling_parameters.rds")
+clean_ups$gravity <- scale(clean_ups$gravity, center = scaling_parameters$gravity_center, scale = scaling_parameters$gravity_scale)
+clean_ups$site_exposure <- scale(clean_ups$site_exposure, center = scaling_parameters$site_exposure_center, scale = scaling_parameters$site_exposure_scale)
+predict_high <- clean_ups %>% dplyr::select(Site, gravity, site_exposure) %>% as.data.frame() %>%  
+                mutate(floatiness = "High dispersal capacity") %>%
+                mutate(num_cleans = 1) %>%
+                mutate(year = "2022")
+predict_low <- clean_ups %>% dplyr::select(Site, gravity, site_exposure) %>% as.data.frame() %>%
+                mutate(floatiness = "Low dispersal capacity") %>%
+                mutate(num_cleans = 1) %>%
+                mutate(year = "2022")
+melted_model <- readRDS("outputs/melted_model.rds")
+predictions_high <- predict(melted_model, newdata = predict_high, type = "response")
+predictions_low <- predict(melted_model, newdata = predict_low, type = "response")
+clean_ups$debris <- predictions_high + predictions_low
+
+site_data <- st_read("data/beaches_linked.gpkg") %>% dplyr::select(Site, geom) %>% filter(Site %in% clean_ups$Site)
+site_data$debris <- clean_ups$debris
+site_data$gravity <- clean_ups$gravity
+site_data$site_exposure <- clean_ups$site_exposure
+st_write(site_data, "outputs/clean_ups with predictions.gpkg")
+
+# Step 1: Calculate Quartiles for gravity and debris
+terciles_gravity <- quantile(coastaldata$gravity, probs = c(1/3, 2/3))
+terciles_debris <- quantile(coastaldata$debris, probs = c(1/3, 2/3))
+
+# Step 2: Categorize Variables
+categorize <- function(value, terciles) {
+  if (value <= terciles[1]) {
+    return("Low")
+  } else if (value <= terciles[2]) {
+    return("Medium")
+  } else {
+    return("High")
+  }
+}
+
+coastaldata <- coastaldata %>%
+  mutate(
+    gravity_category = sapply(gravity, categorize, terciles_gravity),
+    debris_category = sapply(debris, categorize, terciles_debris)
+  )
+
+# Step 3: Combine Categories
+coastaldata <- coastaldata %>%
+  mutate(
+    combined_category = paste(gravity_category, debris_category, sep = "_")
+  )
+
+# Step 4: Assess the currenty prioritisation of clean ups
+#Scenario 1: Nearest point to clean up
+nearest_indices <- st_nearest_feature(clean_ups, coastaldata)
+clean_ups$combined_category <- coastaldata$combined_category[nearest_indices]
+clean_ups$gravity_category <- coastaldata$gravity_category[nearest_indices]
+clean_ups$debris_category <- coastaldata$debris_category[nearest_indices]
+clean_ups$gravity <- coastaldata$gravity[nearest_indices]
+clean_ups$debris <- coastaldata$debris[nearest_indices]
+table(clean_ups$combined_category)
+st_write(clean_ups, "outputs/clean_ups_assessment.gpkg")
+#Scenario 2: Predicting amongst sites themselves
+clean_ups <- st_read("outputs/clean_ups with predictions.gpkg")
+clean_ups <- clean_ups %>%
+  mutate(
+    gravity_category = sapply(gravity, categorize, terciles_gravity),
+    debris_category = sapply(debris, categorize, terciles_debris)
+  ) %>%
+  mutate(
+    combined_category = paste(gravity_category, debris_category, sep = "_")
+  )
+table(clean_ups$combined_category)
+st_write(clean_ups, "outputs/clean_ups_assessment2.gpkg")
+
+
+coastaldata %>% filter(combined_category %in% c("High_High", "High_Medium", "Medium_High")) %>%
+st_write("outputs/high_priority_sites.gpkg")
+library(mapview)
+mapview(temp, zcol = "combined_category") + mapview(clean_ups, color = "blue")
+```
+# 7. Validate gravity through external dataset
+```{R}
+beaches <- st_read("outputs/beaches_species_notscaled.gpkg")
+beaches <- rename(beaches, "Gravity" = gravity)
+beaches <- rename(beaches, "Exposure" = exposure)
+beaches <- st_buffer(beaches, 200)
+#Using visitation raster, here we have less overlap in beaches, but a higher level of correlation where they do overlap 
+visit_r <- rast("data/tourism_rast.tif")
+rcl <- matrix(c(2147483647, NA), ncol = 2, byrow = TRUE)
+visit_r <- classify(visit_r, rcl)
+for(i in 1:nrow(beaches)){
+  beach <- beaches[i,]
+  beaches$reef_vis[i] <- mean(terra::extract(visit_r, beach)$tourism_rast, na.rm = TRUE)
+}
+beach_cor <- filter(beaches, !is.na(reef_vis))
+cor.test(beach_cor$reef_vis, beach_cor$Gravity, method = "pearson")
+
+
+visit_r <- rast("data/tourism_value.tif") %>% crop(beaches) #visitation value
+rcl <- matrix(c(65535, NA), ncol = 2, byrow = TRUE)
+visit_r <- classify(visit_r, rcl)
+for(i in 1:nrow(beaches)){
+  beach <- beaches[i,]
+  beaches$reef_vis[i] <- mean(terra::extract(visit_r, beach)$tourism_value, na.rm = TRUE)
+}
+beach_cor <- filter(beaches, !is.na(reef_vis))
+cor.test(beach_cor$reef_vis, beach_cor$Gravity, method = "pearson")
+
+#reef_visitor <- st_read("outputs/adjacent visitors clipped.shp") %>% st_transform(32755)
+#reef_visitor <- st_read("data/reef_adjacent_value.shp") %>% st_transform(st_crs(beaches))
+# for(i in 1:nrow(beaches)){
+#   beach <- beaches[i,]
+#   reef_data <- st_intersection(beach, reef_visitor)
+#   if(nrow(reef_data) > 0){
+#   beaches$reef_vis[i] <- reef_data$Total_val 
+#   } else {
+#   beaches$reef_vis[i] <- NA
+#   }
+# }
+# beach_cor <- filter(beaches, !is.na(reef_vis))
+# cor.test(beach_cor$reef_vis, beach_cor$Gravity, method = "pearson")
+```
+

@@ -1,0 +1,275 @@
+---
+Authors: Michael Joel Traurig, Kay Critchell
+Title: Population pressure modelling for Coastal clean-up prioritisation with open-access, data-lean models informs better decisions
+Version: 0.9 (Submission of manuscript)
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# 1. Load libraries and functions
+```{R}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, sf, raster, terra, fasterize, reshape2, effects, gridExtra, geosphere, mapview, gdistance, viridis)
+source("code/function script.r")
+```
+
+# 2. Load datasets and prepare data for analysis
+Align projections, crop to same extent, and filter out non ocean ports
+```{R loading data}
+e <- extent(148.00916, 149.34895, -21.34380, -19.90391)
+pop_raster  		<- rast("data/population_aus_northeast_2018-10-01.tif") %>%
+                       crop(e) %>%
+                       project("+proj=utm +zone=55 +south +ellps=WGS84 +datum=WGS84 +units=m +no_defs")#population density grid cells
+ecodata_reduced 	<- read.csv("data/ECObarg_sites.csv") %>%
+                       dplyr::select(2,9,10) %>%
+					   unique()
+queensland_roads 	<- st_read("data/queensland_roads.gpkg") %>%
+                       st_crop(e) %>%
+					   filter(CLASS != "Ferry") %>%
+					   st_transform(crs = st_crs(pop_raster)) %>%
+					   st_as_sf()
+bathy				<- rast("data/3_ausseabed_Great_Barrier_Reef_C_2020_30m_OV.tif") %>%
+					   crop(e) %>%
+					   project("+proj=utm +zone=55 +south +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+site_points 		<- st_as_sf(ecodata_reduced, coords=c("Longitude", "latitude"), crs="+proj=longlat +ellips=WGS84") %>%
+					   st_transform(crs = st_crs(pop_raster)) %>%
+					   filter(!str_detect(Site, "Urban Surrounds")) %>%
+					   group_by(Site) %>%
+					   summarize(geometry = st_centroid(st_union(geometry)))
+ports       		<- st_read("data/ports.gpkg") %>%
+					   st_transform(crs = st_crs(pop_raster)) %>%
+					   st_crop(site_points) %>%
+					   filter(FACILITY == "Boat Ramp") %>%
+					   filter(!NAME %in% c("Peter Faust Dam via Proserpine",
+					   					   "Murray Creek, Landing Road",
+										   "Mount Jukes, Howell's Road (Constant Creek)",
+										   "Pleystowe",
+										   "Kinchant Dam, Kinchant Dam Road",
+										   "Teemburra Dam, Lucas Paddock Road",
+										   "Eungella Dam, Eungella Dam Road",
+										   "Andergrove, Apsley Way",
+										   "Mackay, River Street",
+										   "Dunnrock, Dunrock Esplanade",
+										   "Proserpine River, Conway Road")) %>%
+					   dplyr::select(NAME) %>%
+					   rename(Site = "NAME") %>%
+					   rename(geometry = "Shape")
+border_poly 		<- st_read("data/Australia_Polygon.shp") %>%
+                       filter(name == "Queensland") %>%
+					   st_crop(e) %>%
+					   st_transform(crs = st_crs(pop_raster))
+```
+# 3. Identify travel time between beaches and ports
+## 3.1 Move beach and ports data to nearest ocean cell, then identify the nearest port to each beach
+```{R}
+# adjust bathy data to ocean
+ocean_presence <- bathy
+ocean_presence[ocean_presence >= 3] <- NA
+ocean_presence[ocean_presence < 3] <- 1
+ocean_presence <- mask(ocean_presence, border_poly, inverse = TRUE, touches = TRUE)
+# Move beach and port points to nearest ocean cell
+beach_points_moved <- move_points_to_ocean(site_points, ocean_presence, sitedata = "Site")
+port_points_moved <- move_points_to_ocean(ports, ocean_presence, sitedata = "Site")
+beaches_linked <- find_nearest_port(beach_points_moved, port_points_moved)
+```
+## 3.2 Calculate the travel time between beaches and ports
+```{R}
+ocean <- mask(bathy, border_poly, inverse = TRUE, touches = TRUE) %>%
+         crop(st_buffer(beaches_linked, 5000))
+ocean_trans <- get_ocean_transition(ocean, 10)
+beaches_linked$ocean_trav <- 0
+for(i in 1:nrow(beaches_linked)){
+  beaches_linked[i, ]$ocean_trav <- get_ocean_travel(origin = beaches_linked[i, ],
+				 destination = port_points_moved,
+				 transition = ocean_trans,
+				 output = "distance")
+}
+#zero out beaches next to roads. Shute harbor, shute harbour slipway, airlie beach,Coral Seas Boardwalk Airlie Beach, conway beach,
+#canonvale beach
+beaches_noocean <- c("Airlie Beach", "Cannonvale Beach", "Coral Seas Boardwalk, Airlie Beach", "Shute Harbour", "Shute Harbour Slipway", "Conway Beach")
+beaches_linked$ocean_trav[beaches_linked$Site %in% beaches_noocean] <- 0
+beaches_linked$nearest_port <- ifelse(beaches_linked$Site %in% beaches_noocean, beaches_linked$Site, beaches_linked$nearest_port)
+st_write(beaches_linked, "data/beaches_linked.gpkg")
+
+beaches_noport <- filter(beaches_linked, Site %in% beaches_noocean) %>% dplyr::select(Site, geometry)
+st_write(rbind(beaches_noport, port_points_moved), "data/port_points_moved.gpkg")
+#This generated line vectors for ocean travel of each location (for visualisation)
+# for(i in 1:nrow(beaches_linked)){
+# 	st_write(get_ocean_travel(origin = beaches_linked[i, ],
+# 				 destination = port_points_moved,
+# 				 transition = ocean_trans,
+# 				 output = "object"), paste0("data/ocean_travel_", beaches_linked[i, ]$Site, ".gpkg"))
+# }
+```
+# 4. Sensitivity analysis and external validation of gravity model
+
+## 4.1 Sensitivity analysis of decay value
+```{R}
+data <- read.csv("outputs/decay_sensitivity.csv")
+#Plot gravity against decay in box plots with error bars
+ggplot(data, aes(x = Decay, y = gravity)) +
+  geom_boxplot() +
+  labs(title = "Gravity sensitivity to decay factor",
+	   x = "Decay factor",
+	   y = "Gravity") +
+  theme_minimal()
+
+# run a generalised linear model with gaussian distribution and site_name as a random effect
+library(lme4)
+library(effects)
+library(car)
+library(glmmTMB)
+model <- lmer(gravity ~ Decay + (1|site_name), data = data)
+#type 2 analysis of varience on model
+car::Anova(model, type = "III")
+summary(model)
+plot(allEffects(model))
+
+model <- glmmTMB(gravity ~ Decay + (1|site_name), data = data, family=Gamma(link="log"))
+summary(model)
+plot(allEffects(model))
+datatoplot <- as.data.frame(allEffects(model))[[1]]
+# plot the effects, they are points with upper and lower values
+ggplot(data=datatoplot, aes(x=Decay, y=fit)) +
+  geom_point(size = 3) +
+  geom_path() +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=.2) +
+  xlab("Decay factor") + ylab("Gravity") +
+  theme(panel.background = element_blank(),
+      panel.grid = element_blank(),
+      axis.text.x = element_text(size = 20),
+      axis.text.y = element_text(size = 15),
+      axis.title.y = element_text(size = 20),
+      axis.title.x = element_text(size = 20),
+    	axis.line = element_line(color = "black"),
+      legend.text = element_text(size = 20),
+      legend.title = element_text(size = 20))
+
+ggplot(datatoplot, aes(x = Decay, y = fit)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lower, ymax = upper)) +
+  labs(title = "Gravity sensitivity to decay factor",
+	   x = "Decay factor",
+	   y = "Gravity") +
+  theme_minimal()
+
+
+if (!requireNamespace("DHARMa", quietly = TRUE)) install.packages("DHARMa")
+library(DHARMa)
+
+# Create simulated residuals
+sim_res <- simulateResiduals(fittedModel = model, n = 250)
+
+# Plot the residuals
+plot(sim_res)
+
+testDispersion(sim_res)
+model$sdr
+```
+## 4.2 Validate the gravity model against tourism visitation data
+```{R}
+sites <- st_read("outputs/beaches_species_notscaled.gpkg")
+data <- filter(data, site_name %in% sites$Site)
+data_wide <- dcast(data, site_name ~ Decay, value.var = "gravity")
+beaches <- sites %>% left_join(data_wide, by = c("Site" = "site_name"))
+beaches <- st_buffer(beaches, 200)
+
+visit_r <- rast("data/tourism_rast.tif")
+rcl <- matrix(c(2147483647, NA), ncol = 2, byrow = TRUE)
+visit_r <- classify(visit_r, rcl)
+for(i in 1:nrow(beaches)){
+  beach <- beaches[i,]
+  beaches$reef_vis[i] <- mean(terra::extract(visit_r, beach)$tourism_rast, na.rm = TRUE)
+}
+beach_cor <- filter(beaches, !is.na(reef_vis))
+#Small
+cor.test(beach_cor$reef_vis, beach_cor$Small, method = "pearson") #59
+#mid
+cor.test(beach_cor$reef_vis, beach_cor$Mid, method = "pearson") #0.5
+#large
+cor.test(beach_cor$reef_vis, beach_cor$Large, method = "pearson") #0.31
+#Gravity
+cor.test(beach_cor$reef_vis, beach_cor$gravity, method = "pearson") #0.476
+
+visit_r <- rast("data/tourism_value.tif") %>% crop(beaches) #visitation value
+rcl <- matrix(c(65535, NA), ncol = 2, byrow = TRUE)
+visit_r <- classify(visit_r, rcl)
+for(i in 1:nrow(beaches)){
+  beach <- beaches[i,]
+  beaches$reef_vis[i] <- mean(terra::extract(visit_r, beach)$tourism_value, na.rm = TRUE)
+}
+beach_cor <- filter(beaches, !is.na(reef_vis))
+#small
+cor.test(beach_cor$reef_vis, beach_cor$Small, method = "pearson") #.64
+#mid
+cor.test(beach_cor$reef_vis, beach_cor$Mid, method = "pearson")
+#large
+cor.test(beach_cor$reef_vis, beach_cor$Large, method = "pearson")
+#gravity
+cor.test(beach_cor$reef_vis, beach_cor$gravity, method = "pearson") #0.53
+```
+# 5. Calculate gravity values
+## 5.1 Calculate the gravity model through a single site to test the function
+```{R}
+beaches_linked <- st_read("data/beaches_linked.gpkg")
+port_points_moved <- st_read("data/port_points_moved.gpkg")
+ports_reduced <- port_points_moved %>%
+				 filter(Site %in% beaches_linked$nearest_port) %>% vect()
+#Look at a single land distance raster
+# mapview(raster(get_land_distance(population = pop_raster,
+#                   origin = ports_reduced[5, ],
+# 				  structures = queensland_roads,
+# 				  decay_factor = 0.0001,
+# 				  land_mask = border_poly))) + mapview(ports_reduced[5, ], color = "green") + mapview(queensland_roads)
+r <- get_land_distance(population = pop_raster,
+				   origin = ports_reduced[6, ],
+				   structures = queensland_roads,
+				   decay_factor = 0.00005,
+				   land_mask = border_poly)
+rlow <- get_land_distance(population = pop_raster,
+				   origin = ports_reduced[6, ],
+				   structures = queensland_roads,
+				   decay_factor = 0.00001,
+				   land_mask = border_poly)
+rhigh <- get_land_distance(population = pop_raster,
+				   origin = ports_reduced[6, ],
+				   structures = queensland_roads,
+				   decay_factor = 0.001,
+				   land_mask = border_poly)
+
+view(beaches_linked)
+  	   calculate_gravity(study_site = beaches_linked[64,],
+                                     population = pop_raster,
+					                 land_distances = r,
+					                 constant = 1)
+```
+## 5.2 Calculate the gravity model through all sites
+```{R}
+rasters <- list()
+for (i in 1:nrow(ports_reduced)) {
+  # Generate a raster using 'get_land_distance'
+  r <- get_land_distance(population = pop_raster,
+                         origin = ports_reduced[i, ],
+                         structures = queensland_roads,
+                         decay_factor = 0.0001,
+                         land_mask = border_poly)
+  # Add the raster to the list
+  rasters[[i]] <- r
+}
+names(rasters) <- ports_reduced$Site
+stack <- terra::rast(rasters)
+writeRaster(stack, "data/land_distance_stack.tif", overwrite = TRUE)
+
+beaches_linked <- st_read("data/beaches_linked.gpkg")
+df <- data.frame(site_name = beaches_linked$Site, 
+				 gravity = 0)
+#land_distances <- rast("data/land_distance_stack.tif")
+#put it together
+for(i in 1:nrow(df)) {
+  df$gravity[i] <- calculate_gravity(study_site = beaches_linked[i,],
+                                     population = pop_raster,
+					                 land_distances = land_distances,
+					                 constant = 1)
+}
+write.csv(df, "outputs/gravity_final.csv")
+```

@@ -1,0 +1,148 @@
+---
+Authors: Michael Joel Traurig, Kay Critchell
+Title: Wave exposure modelling for Coastal clean-up prioritisation with open-access, data-lean models informs better decisions
+Version: 0.9 (Submission of manuscript)
+---
+In this document we will replicate gremo model to conduct wave exposure on our training dataset locations. We will also conduct a sensitivity analysis on the fetch power used in length weighting
+
+# 1. Load required libraries and functions
+windfetch is a non CRAN package, so we need to install it from GitHub. We also load other required libraries and source our function script.
+```{R}
+if(!require(pacman)){install.packages("pacman")}
+pacman::p_load(sf, terra, tidyverse, lwgeom, sfheaders)
+if(!require(windfetch)){
+  if(!require(remotes)){install.packages("remotes")}
+    remotes::install_github("blasee/windfetch")
+    library(windfetch)
+}
+source("code/function script.r")
+```
+
+# 2. Load data layers and align projections
+```{R}
+#e <- ext(148.00916, 149.34895, -21.34380, -19.90391)
+ecodata_reduced 	<- read.csv("data/ECObarg_sites.csv") %>%
+                     dplyr::select(2,9,10) %>%
+					           unique()
+
+site_points <- st_read("data/beaches_linked.gpkg") %>%
+			   filter(!Site %in% c("Rattray, Grumbell, Grassy Islands", "Goat Island Beach, South Molle Island"))
+bathy				<- rast("data/3_ausseabed_Great_Barrier_Reef_C_2020_30m_OV.tif") %>%
+					     project("+proj=utm +zone=55 +south +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+border_poly 		<- st_read("data/Australia_Polygon.shp") %>%
+                       filter(name == "Queensland") %>%
+					   st_transform(crs = st_crs(bathy))
+```
+
+# 3. Create Fetchlines
+```{R}
+#Adjust bathymetry (a bathymetry of 5 was selected as it ensured sites were not on land (where windfetch would fail, but also maximised closeness of points to beaches)
+bathy[bathy <= 5] <- NA
+bathy[bathy >= 5] <- 1
+obstacles <- st_union(st_as_sf(as.polygons(bathy)), st_geometry(border_poly))
+my_fetch <- windfetch(obstacles, site_points %>% select("Site"), n_directions = 9, max_dist = 600)
+fetch_sf <- as_sf(my_fetch)
+sites <- data.frame(Sites = site_points$Site)
+for(i in 1:length(sites$Sites)){
+	sites$fetch_site[i] <- paste0("Site ", i)
+}
+#left join sites to my_fetch
+fetch_sf <- left_join(fetch_sf, sites, by = c("site_name" = "fetch_site"))
+#calculate the length of each linestring and add that length as a column
+st_write(fetch_sf, "outputs/fetch_final_36.gpkg")
+```
+
+# 4. Adjust fetchlines with wind data, and calculate wind exposure for sites
+```{R}
+fetch_sf <- st_read("outputs/fetch_final_36.gpkg")
+wind_data <- read.csv("data/wind/HM01X_Data_033255_999999999512646.txt") %>%
+             filter(Wind.speed.in.km.h != 0) %>%
+			 mutate(Wind.direction.in.degrees.true = ifelse(Wind.direction.in.degrees.true == 360, 0, Wind.direction.in.degrees.true))
+wind_summarized <- wind_data %>%
+				   group_by(Wind.direction.in.degrees.true) %>%
+				   summarize(Wind.speed = mean(Wind.speed.in.km.h),
+				             frequency = n()/length(wind_data$Wind.direction.in.degrees.true))
+#sensitivity analysis was conducted on broad fetch powers first, we first narrowed down to powers between .2 and .4
+exposure_testing <- left_join(fetch_sf, wind_summarized, by = c("directions" = "Wind.direction.in.degrees.true")) %>% 
+	mutate(fetch_log = log(fetch)) %>%
+	mutate(fetch_invsq = 1/(fetch^2)) %>%
+	mutate(fetch_hyp = asinh(fetch)) %>%
+	mutate(fetch_pw_1 = fetch^0.1) %>%
+	mutate(fetch_pw_2 = fetch^0.2) %>%
+	mutate(fetch_pw_3 = fetch^0.3) %>%
+	mutate(fetch_pw_4 = fetch^0.4) %>%
+	mutate(fetch_pw_5 = fetch^0.5) %>%
+	mutate(fetch_pw_6 = fetch^0.6) %>%
+	mutate(fetch_pw_7 = fetch^0.7) %>%
+	mutate(fetch_pw_8 = fetch^0.8) %>%
+	mutate(fetch_pw_9 = fetch^0.9) %>%
+	mutate(fetch_1x = 1/fetch)
+
+# We then conducted sensitivtiy analysis on the more refined powers (through a dredge model selection and found that the best performing model had a fetch power of .3)
+exposure_testing <- exposure_testing %>% group_by(Sites) %>%
+					summarize(exposure = sum(fetch*Wind.speed*frequency),
+							  log_exposure = sum(fetch_log*Wind.speed*frequency),
+							  invsq_exposure = sum(fetch_invsq*Wind.speed*frequency),
+							  hyp_exposure = sum(fetch_hyp*Wind.speed*frequency),
+							  pw_1_exposure = sum(fetch_pw_1*Wind.speed*frequency),
+							  pw_2_exposure = sum(fetch_pw_2*Wind.speed*frequency),
+							  pw_3_exposure = sum(fetch_pw_3*Wind.speed*frequency),
+							  pw_4_exposure = sum(fetch_pw_4*Wind.speed*frequency),
+							  pw_5_exposure = sum(fetch_pw_5*Wind.speed*frequency),
+							  pw_6_exposure = sum(fetch_pw_6*Wind.speed*frequency),
+							  pw_7_exposure = sum(fetch_pw_7*Wind.speed*frequency),
+							  pw_8_exposure = sum(fetch_pw_8*Wind.speed*frequency),
+							  pw_9_exposure = sum(fetch_pw_9*Wind.speed*frequency),
+							  inv_exposure = sum(fetch_1x*Wind.speed*frequency))
+
+st_write(exposure_testing, "outputs/exposure_data_testing.gpkg")
+
+exposure_testing2 <- left_join(fetch_sf, wind_summarized, by = c("directions" = "Wind.direction.in.degrees.true")) %>% 
+	mutate(fetch_pw_2 = fetch^0.2) %>%
+	mutate(fetch_pw_21 = fetch^0.21) %>%
+	mutate(fetch_pw_22 = fetch^0.22) %>%
+	mutate(fetch_pw_23 = fetch^0.23) %>%
+	mutate(fetch_pw_24 = fetch^0.24) %>%
+	mutate(fetch_pw_25 = fetch^0.25) %>%
+	mutate(fetch_pw_26 = fetch^0.26) %>%
+	mutate(fetch_pw_27 = fetch^0.27) %>%
+	mutate(fetch_pw_28 = fetch^0.28) %>%
+	mutate(fetch_pw_29 = fetch^0.29) %>%
+	mutate(fetch_pw_3 = fetch^0.3) %>%
+	mutate(fetch_pw_31 = fetch^0.31) %>%
+	mutate(fetch_pw_32 = fetch^0.32) %>%
+	mutate(fetch_pw_33 = fetch^0.33) %>%
+	mutate(fetch_pw_34 = fetch^0.34) %>%
+	mutate(fetch_pw_35 = fetch^0.35) %>%
+	mutate(fetch_pw_36 = fetch^0.36) %>%
+	mutate(fetch_pw_37 = fetch^0.37) %>%
+	mutate(fetch_pw_38 = fetch^0.38) %>%
+	mutate(fetch_pw_39 = fetch^0.39) %>%
+	mutate(fetch_pw_4 = fetch^0.4)
+
+exposure_testing2 <- exposure_testing2 %>% group_by(Sites) %>%
+					summarize(exposure = sum(fetch*Wind.speed*frequency),
+							  pw_2_exposure = sum(fetch_pw_2*Wind.speed*frequency),
+							  pw_21_exposure = sum(fetch_pw_21*Wind.speed*frequency),
+							  pw_22_exposure = sum(fetch_pw_22*Wind.speed*frequency),
+							  pw_23_exposure = sum(fetch_pw_23*Wind.speed*frequency),
+							  pw_24_exposure = sum(fetch_pw_24*Wind.speed*frequency),
+							  pw_25_exposure = sum(fetch_pw_25*Wind.speed*frequency),
+							  pw_26_exposure = sum(fetch_pw_26*Wind.speed*frequency),
+							  pw_27_exposure = sum(fetch_pw_27*Wind.speed*frequency),
+							  pw_28_exposure = sum(fetch_pw_28*Wind.speed*frequency),
+							  pw_29_exposure = sum(fetch_pw_29*Wind.speed*frequency),
+							  pw_3_exposure = sum(fetch_pw_3*Wind.speed*frequency),
+							  pw_31_exposure = sum(fetch_pw_31*Wind.speed*frequency),
+							  pw_32_exposure = sum(fetch_pw_32*Wind.speed*frequency),
+							  pw_33_exposure = sum(fetch_pw_33*Wind.speed*frequency),
+							  pw_34_exposure = sum(fetch_pw_34*Wind.speed*frequency),
+							  pw_35_exposure = sum(fetch_pw_35*Wind.speed*frequency),
+							  pw_36_exposure = sum(fetch_pw_36*Wind.speed*frequency),
+							  pw_37_exposure = sum(fetch_pw_37*Wind.speed*frequency),
+							  pw_38_exposure = sum(fetch_pw_38*Wind.speed*frequency),
+							  pw_39_exposure = sum(fetch_pw_39*Wind.speed*frequency),
+							  pw_4_exposure = sum(fetch_pw_4*Wind.speed*frequency))
+
+st_write(exposure_testing2, "outputs/exposure_data_testing2.gpkg")
+```

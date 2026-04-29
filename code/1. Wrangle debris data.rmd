@@ -1,0 +1,159 @@
+---
+Authors: Michael Joel Traurig, Kay Critchell
+Title: Debris data wrangling for Coastal clean-up prioritisation with open-access, data-lean models informs better decisions
+Version: 0.9 (Submission of manuscript)
+---
+# 1. Load packages and functions
+```{R}
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, sf, terra, glmmTMB, tmap, tidyterra)
+source("code/function script.r")
+```
+# 2. Load debris data combine and wrangle for analysis (adding floatiness categories)
+```{R}
+data <- read.csv("data/ecobarg_event_data.csv")
+data_2022 <- read.csv("data/Ecobarg_2022_data.csv")
+
+data$Item <- as.factor(data$Item)
+#get most common levels that appear in more than 50 clean ups (arbitrary could be modified)
+Items <- table(data$Item)
+Items <- names(Items[which(Items>50)])
+Items <- c(Items, "Plastic drink bottles (PET eg.soft drink)", "Milk and Juice ( Non PET)") #these categories were combined as a single category prior to 2022, so adding them in for subsetting 2022 data (needed for correlation analysis)
+
+data_2022_fixed <- data_2022[data_2022$Location_fixed %in% Items,] #select the same categories as the old data
+data_2022_fixed <- pivot_longer(data_2022_fixed, cols = -Location_fixed, names_to = "Site", values_to = "Totals") %>% rename (Category = Location_fixed)
+Sites <- unique(data_2022_fixed$Site)
+data_2022_fixed <- Fix_2022_sites(data_2022_fixed) #Corrects site names to match previous data set
+data_2022_fixed$Totals <- as.numeric(data_2022_fixed$Totals)
+data_2022_fixed$Totals[is.na(data_2022_fixed$Totals)] <- 0
+data_2022_fixed$year <- as.factor(data_2022_fixed$year)
+
+data_fixed <- data[data$Item %in% Items, ]
+data_fixed$Date <- as.POSIXct(data_fixed$Date, format = "%d/%m/%Y")
+data_fixed$year <- format(data_fixed$Date, format="%Y")
+#Removing a single event as it was a clean up of a large boat vessel and was considered an outlier (not a typical clean up)
+data_fixed <- filter(data_fixed, year != 2016 | Site != "Armit Island")
+
+df <- rbind(data_fixed %>% select(1,2,4,7,11) %>%
+ rename(Category = "Item"), data_2022_fixed) %>%
+ filter(!Site %in% c("Rattray, Grumbell, Grassy Islands", "Goat Island Beach, South Molle Island")) %>%
+ filter(Category != "Cleanup data not recorded")
+
+drift_data <- read.csv("data/drift_categories.csv")
+names(drift_data) <- c("Material", "Item_type", "Item_examples", "Dispersive_capacity")
+unique(drift_data$Dispersive_capacity)
+drift_data$Dispersive_capacity <- gsub("Encumbered drift", "Encumbered Drift", drift_data$Dispersive_capacity)
+
+cats <- unique(df$Category) %>% sort()
+df <- df %>% mutate(floatiness = case_when(
+	                Category == cats[1] ~ "Very Mobile", #Aerosol cans
+					Category == cats[2] ~ "Limited Dispersion", #Aluminium cans
+					Category == cats[3] ~ "Limited Dispersion", #Appliances, electronics & batteries
+					Category == cats[4] ~ "Limited Dispersion", #Bait & tackle bags & packaging
+					Category == cats[5] ~ "Limited Dispersion", #Bait containers & lids, bait savers
+					Category == cats[6] ~ "Encumbered Drift", #Baskets, crates & trays 
+					Category == cats[7] ~ "Encumbered Drift", #Binding, thread, string and cord (natural fibre)
+					Category == cats[8] ~ "Encumbered Drift", #Blasting items
+					Category == cats[9] ~ "Very Mobile", #Bleach & cleaner bottles
+					Category == cats[10]~ "Very Mobile", #Bleach bottle KKK type
+					Category == cats[11] ~ "Does Not Disperse", #Boat parts, wreckage & remnants
+					Category == cats[12] ~ "Encumbered Drift", #Brooms, brushes & paint brushes
+					Category == cats[13] ~ "Does Not Disperse", #Building & trade materials, fixings & fittings
+					Category == cats[14]~ "Encumbered Drift", #Cable ties & plastic fasteners
+					Category == cats[15]~ "Encumbered Drift", #Canvas, sailcloth & hessian materials
+					Category == cats[16]~ "Encumbered Drift", #Carpet & lino household, boat deck & padding
+					Category == cats[17]~ "Limited Dispersion", #Chemical glow sticks
+					Category == cats[18]~ "Encumbered Drift", #Childcare items
+					Category == cats[19]~ "Limited Dispersion", #Cigarette butts & filters
+					Category == cats[20]~ "Very Mobile", #Cigarette lighters
+					Category == cats[21]~ "Encumbered Drift", #Cloth, clothing, hats & towels
+					Category == cats[22]~ "Encumbered Drift", #Commercial fishing remnants (float, pot, crate bits)
+					Category == cats[23]~ "Limited Dispersion", #Commercial fishing traps, pots & intact parts
+					Category == cats[24]~ "Limited Dispersion", #Drug paraphernalia
+					Category == cats[25]~ "Unencumbered Drift", #Fibreglass fragments
+					Category == cats[26]~ "Limited Dispersion", #Fishing line in metres (Recreation)
+					Category == cats[27]~ "Encumbered Drift", #Fishing net over 1 metre in metres
+					Category == cats[28]~ "Limited Dispersion", #Fluorescent light tubes and bulbs
+					Category == cats[29]~ "Very Mobile", #Foam buoys
+					Category == cats[30]~ "Very Mobile", #Foam cups, food packs & trays
+					Category == cats[31]~ "Very Mobile", #Foam insulation & packaging (whole and remnants)
+					Category == cats[32]~ "Encumbered Drift", #Foam sponge sheeting (mattress & similar)
+					Category == cats[33]~ "Encumbered Drift", #Foil wrappers, packets, bladders & alfoil
+					Category == cats[34]~ "Does Not Disperse", #Glass beer stubbies & pre-mixed alcohol bottles
+					Category == cats[35]~ "Unencumbered Drift", #Glass jars & sauce bottles
+					Category == cats[36]~ "Does Not Disperse", #Glass or ceramic broken
+					Category == cats[37]~ "Unencumbered Drift", #Glass wine, spirit and similar bottles
+					Category == cats[38]~ "Unencumbered Drift", #Lids & tops, pump spray, flow restrictor & similar
+					Category == cats[39]~ "Very Mobile", #Marine safety, survival & boating equipment
+					Category == cats[40]~ "Does Not Disperse", #Metal bottle caps, lids & pull tabs
+					Category == cats[41]~ "Limited Dispersion", #Metal Fishing Items (Sinkers, lures, hooks, traps, pots)
+					Category == cats[42]~ "Does Not Disperse", #Metal outdoor equipment, implements, furniture
+					Category == cats[43]~ "Limited Dispersion", #Metal scrap & remnants
+					Category == cats[44]~ "Limited Dispersion", #Miscellaneous paper, labels & tickets
+					Category == cats[45]~ "Unencumbered Drift", #Municipal activities (tree guard, barrier fence etc)
+					Category == cats[46]~ "Cannot decide", #Occupational health & safety items
+					Category == cats[47]~ "Unencumbered Drift", #Packaging accessories (seals, reels, spools, handles)
+					Category == cats[48]~ "Limited Dispersion", #Paper & Cardboard items
+					Category == cats[49]~ "Encumbered Drift", #Pens, markers & other plastic stationary
+					Category == cats[50]~ "Very Mobile", #Personal care & pharmaceutical packaging
+					Category == cats[51]~ "Does Not Disperse", #Personal effects (wallets, money, keys, jewellery)
+					Category == cats[52]~ "Limited Dispersion", #Plastic bags supermarket, garbage, dog poo, ice
+					Category == cats[53]~ "Unencumbered Drift", #Plastic bits & pieces hard & solid
+					Category == cats[54]~ "Very Mobile", #Plastic bottles, drums, jerrycans & buckets over 4 litres
+					Category == cats[55]~ "Very Mobile", #Plastic buoys and floats
+					Category == cats[56]~ "Very Mobile", #Plastic containers non food (oil, sealant, chemical)
+					Category == cats[57]~ "Very Mobile", #Plastic drink bottles (water, juice, milk, soft drink)
+					Category == cats[58]~ "Encumbered Drift", #Plastic electrical cable, connectors & fittings
+					Category == cats[59]~ "Limited Dispersion", #Plastic farming implements, devices & fittings
+					Category == cats[60]~ "Encumbered Drift", #Plastic farming implements, devices & fittings
+					Category == cats[61]~ "Limited Dispersion", #Plastic first aid materials & equipment (band aids)
+					Category == cats[62]~ "Limited Dispersion", #Plastic furniture outdoor & camping
+					Category == cats[63]~ "Limited Dispersion", #Plastic gardening items, implements & fittings
+					Category == cats[64]~ "Limited Dispersion", #Plastic housewares, tablewares, house fittings
+					Category == cats[65]~ "Unencumbered Drift", #Plastic oddments
+					Category == cats[66]~ "Encumbered Drift", #Plastic packaging food (wrap, packets, containers)
+					Category == cats[67]~ "Encumbered Drift", #Plastic pipe PVC, irrigation & reticulation
+					Category == cats[68]~ "Encumbered Drift", #Plastic sheeting (tarpaulin, woven bags, pallet wrap)
+					Category == cats[69]~ "Encumbered Drift", #Plastic tubes & hoses
+					Category == cats[70]~ "Encumbered Drift", #Plastic vehicle parts
+					Category == cats[71]~ "Encumbered Drift", #Plastic wrap non food (bubble wrap etc)
+					Category == cats[72]~ "Encumbered Drift", #Processed timber, pallets & other wood
+					Category == cats[73]~ "Encumbered Drift", #Recreation & outdoor equipment
+					Category == cats[74]~ "Unencumbered Drift", #Recreation fishing items (lures, floats, rods, reels)
+					Category == cats[75]~ "Unencumbered Drift", #Remnants burnt plastic
+					Category == cats[76]~ "Encumbered Drift", #Rope & net scraps less than 1 metre
+					Category == cats[77]~ "Encumbered Drift", #Rope (estimated length in metres)
+					Category == cats[78]~ "Unencumbered Drift", #Rubber balloons, balls & toys, elastic straps & bands
+					Category == cats[79]~ "Limited Dispersion", #Rubber buffers, tyres, seals & similar
+					Category == cats[80]~ "Unencumbered Drift", #Rubber footwear & thongs
+					Category == cats[81]~ "Unencumbered Drift", #Rubber remnants
+					Category == cats[82]~ "Encumbered Drift", #Rubber sheeting
+					Category == cats[83]~ "Does Not Disperse", #Sanitary (tissues, nappies, condoms, cotton buds)
+					Category == cats[84]~ "Cannot Decide", #Shoes leather & fabric
+					Category == cats[85]~ "Unencumbered Drift", #Shotgun cartridges and wadding
+					Category == cats[86]~ "Limited Dispersion", #Strapping band scraps
+					Category == cats[87]~ "Limited Dispersion", #Strapping band whole (record as single item)
+					Category == cats[88]~ "Very Mobile", #Straws, confection sticks, cups, plates & cutlery
+					Category == cats[89]~ "Encumbered Drift", #Synthetic cardboard (corflute) signs & packaging
+					Category == cats[90]~ "Unencumbered Drift", #Syringes medical
+					Category == cats[91]~ "Encumbered Drift", #Tags
+					Category == cats[92]~ "Encumbered Drift", #Tape adhesive, electrical, duct, hazard marker & rolls
+					Category == cats[93]~ "Unencumbered Drift", #Tetra packs & drink cartons
+					Category == cats[94]~ "Limited Dispersion", #Tins under 4 litres (food, drink tins and similar)
+					Category == cats[95]~ "Unencumbered Drift", #Toothbrushes, brushes & combs, hair ties etc
+					Category == cats[96]~ "Cannot Decide", #Toys, party poppers, ribbons, clips & similar
+					Category == cats[97]~ "Does Not Disperse", #Wire, metal stakes & pipes
+					Category == cats[98]~ "Unencumbered Drift", #Wooden furniture
+					Category == cats[99]~ "Very Mobile", #Plastic drink bottles (PET eg.soft drink)
+					Category == cats[100]~ "Unencumbered Drift", #Milk and Juice ( Non PET)
+					TRUE ~ "Unknown"))
+df <- df %>% filter(!str_detect(Site, "Urban Surrounds")) %>%
+	         filter(Site != "Not sure") %>%
+			 filter(floatiness != "Cannot Decide")
+write.csv(df, "data/Ecobarg_data_sorted_floatiness.csv")
+debris_data <- df %>% group_by(Site, year, Event.ID, floatiness) %>% summarize(Totals = sum(Totals)) %>% ungroup()
+write.csv(debris_data, "outputs/debris_data.csv")
+
+debris_data2 <- df %>% group_by(Site, year, floatiness) %>% summarize(Totals = sum(Totals), num_cleans = n_distinct(Event.ID)) %>% ungroup()
+write.csv(debris_data2, "outputs/debris_data_with_weights.csv")
+```
