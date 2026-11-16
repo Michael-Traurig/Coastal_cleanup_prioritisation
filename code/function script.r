@@ -308,3 +308,171 @@ plot_interaction = function(model, variable, xlab, title, ylab, limits, leg_titl
 	  plot.title = element_text(hjust = 0.5))
   }
 }
+
+# ============================================================
+# Function for predicting total debris across five categories
+# ============================================================
+
+five_floatiness_levels <- c(
+  "Does Not Disperse",
+  "Limited Dispersion",
+  "Encumbered Drift",
+  "Very Mobile",
+  "Unencumbered Drift"
+)
+
+predict_five_category_debris <- function(
+    new_data,
+    fitted_model,
+    scaling_parameters) {
+
+  # Remove geometry temporarily if an sf object was supplied.
+
+  model_inputs <- if (
+    inherits(new_data, "sf")
+  ) {
+    st_drop_geometry(new_data)
+  } else {
+    as.data.frame(new_data)
+  }
+
+  required_columns <- c(
+    "Site",
+    "gravity",
+    "site_exposure"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(model_inputs)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      paste(
+        "The following prediction variables are missing:",
+        paste(
+          missing_columns,
+          collapse = ", "
+        )
+      )
+    )
+  }
+
+  model_inputs <- model_inputs %>%
+    dplyr::select(
+      Site,
+      gravity,
+      site_exposure
+    ) %>%
+    mutate(
+      Site = as.character(Site),
+      gravity = as.numeric(gravity),
+      site_exposure = as.numeric(site_exposure)
+    )
+
+  if (anyDuplicated(model_inputs$Site)) {
+    stop(
+      paste(
+        "Each row supplied to the prediction function must",
+        "have a unique Site identifier."
+      )
+    )
+  }
+
+  if (
+    anyNA(model_inputs) ||
+    any(!is.finite(model_inputs$gravity)) ||
+    any(!is.finite(model_inputs$site_exposure))
+  ) {
+    stop(
+      "Missing or non-finite predictor values were supplied."
+    )
+  }
+
+  # Generate five rows for each coastline location.
+
+  prediction_data <- tidyr::crossing(
+    model_inputs,
+    floatiness = five_floatiness_levels
+  ) %>%
+    mutate(
+      floatiness = factor(
+        floatiness,
+        levels = five_floatiness_levels
+      ),
+      num_cleans = 1
+    )
+
+  # A valid training-year level is supplied because year appears
+  # in the model structure. It does not affect these predictions
+  # because re.form = NA excludes the year random effect.
+
+  reference_year <- as.character(
+    fitted_model$frame$year[1]
+  )
+
+  training_year_levels <- levels(
+    fitted_model$frame$year
+  )
+
+  if (is.null(training_year_levels)) {
+    training_year_levels <- unique(
+      as.character(
+        fitted_model$frame$year
+      )
+    )
+  }
+
+  prediction_data <- prediction_data %>%
+    mutate(
+      Site = factor(Site),
+      year = factor(
+        reference_year,
+        levels = training_year_levels
+      )
+    )
+
+  # Generate population-level predictions.
+  #
+  # re.form = NA excludes both Site and year random effects.
+  # Predictions therefore represent the relationships with
+  # gravity, exposure and debris dispersal category.
+
+  prediction_data$predicted_debris <-
+    predict(
+      fitted_model,
+      newdata = prediction_data,
+      type = "response",
+      re.form = NA,
+      allow.new.levels = TRUE
+    )
+
+  # Retain category-specific predictions.
+
+  category_predictions <-
+    prediction_data %>%
+    dplyr::select(
+      Site,
+      floatiness,
+      predicted_debris
+    )
+
+  # Sum the five predictions to obtain one accumulation score
+  # for each location.
+
+  total_predictions <-
+    category_predictions %>%
+    group_by(Site) %>%
+    summarise(
+      debris = sum(
+        predicted_debris
+      ),
+      .groups = "drop"
+    )
+
+  list(
+    totals = total_predictions,
+    categories = category_predictions
+  )
+}
