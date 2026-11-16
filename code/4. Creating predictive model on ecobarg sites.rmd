@@ -1,13 +1,13 @@
 ---
 Authors: Michael Joel Traurig, Kay Critchell
 Title: Creating predictive debris accumulation model for Coastal clean-up prioritisation with open-access, data-lean models informs better decisions
-Version: 0.9 (Submission of manuscript)
+Version: 1.0 (Publication)
 ---
 
 # Load libraries
 ```{R}
 if(!require("pacman")) install.packages("pacman")
-pacman::p_load(tidyverse, windfetch, raster, sf, terra, gdistance, glmmTMB, tmap, MuMIn, tidyterra, lme4, MASS, effects, AER, ggpubr, vegan, viridis, cowplot, biscale, RColorBrewer, caret, pROC, boot)
+pacman::p_load(tidyverse, windfetch, raster, sf, terra, gdistance, glmmTMB, tmap, MuMIn, tidyterra, lme4, MASS, effects, AER, ggpubr, vegan, viridis, cowplot, biscale, RColorBrewer, caret, pROC, boot, broom.mixed, emmeans)
 source("code/function script.r")
 ```
 
@@ -54,17 +54,17 @@ combined_data_test <- combined_data_test %>% mutate(gravity = scale(gravity, cen
 levels_order <- c("Does Not Disperse", "Limited Dispersion", "Encumbered Drift", "Very Mobile", "Unencumbered Drift")
 combined_data_test$floatiness <- factor(combined_data_test$floatiness, levels = levels_order)
 
-# models <- list()
+models <- list()
 
-# for(i in 1:length(exposure_vars)){
-#   formula_str <- paste("Totals ~", exposure_vars[i], "+ floatiness + gravity + gravity*floatiness +", exposure_vars[i], "*floatiness + (1|Site) + (1|year)")
-#   model <- glmmTMB(as.formula(formula_str), offset = num_cleans, data = combined_data_test, family = nbinom2(link = "log"))
-#   models[[i]] <- model
-# }
-# results <- model.sel(models, rank = "AICc")
-# view(results) # Results showed that the model with a power transformation of 0.3 was the best fit. power of 0.4 or 0.2 were within 2aic but 0.3 makes the most sense (visualising the shape).
+for(i in 1:length(exposure_vars)){
+  formula_str <- paste("Totals ~", exposure_vars[i], "+ floatiness + gravity + gravity*floatiness +", exposure_vars[i], "*floatiness + (1|Site) + (1|year)")
+  model <- glmmTMB(as.formula(formula_str), offset(log(num_cleans), data = combined_data_test, family = nbinom2(link = "log"))
+  models[[i]] <- model
+}
+results <- model.sel(models, rank = "AICc")
+view(results) # Results showed that the model with a power transformation of 0.3 was the best fit. power of 0.4 or 0.2 were within 2aic but 0.3 makes the most sense (visualising the shape).
 
-#Testing out more refined best fit
+#Testing out more refined best fit (to see if fractions of powers make a difference)
 exposure_testing <- st_read("outputs/exposure_data_testing2.gpkg")
 combined_data_test <- left_join(debris_data, gravity_data, by = c("Site" = "site_name"))
 combined_data_test <- left_join(combined_data_test, exposure_testing, by = c("Site" = "Sites")) %>%
@@ -77,45 +77,230 @@ combined_data_test <- combined_data_test %>% mutate(gravity = scale(gravity, cen
 levels_order <- c("Does Not Disperse", "Limited Dispersion", "Encumbered Drift", "Very Mobile", "Unencumbered Drift")
 combined_data_test$floatiness <- factor(combined_data_test$floatiness, levels = levels_order)
 
-# models <- list()
+models <- list()
 
-# for(i in 1:length(exposure_vars)){
-#   formula_str <- paste("Totals ~", exposure_vars[i], "+ floatiness + gravity + gravity*floatiness +", exposure_vars[i], "*floatiness + (1|Site) + (1|year)")
-#   model <- glmmTMB(as.formula(formula_str), offset = num_cleans, data = combined_data_test, family = nbinom2(link = "log"))
-#   models[[i]] <- model
-# }
-# results <- model.sel(models, rank = "AICc")
-# view(results) # Results showed that the model with a power transformation of 0.3 was 0.01 of best fit (which was 0.31). Have kept the power level at 0.3 for the final model.
+for(i in 1:length(exposure_vars)){
+  formula_str <- paste("Totals ~", exposure_vars[i], "+ floatiness + gravity + gravity*floatiness +", exposure_vars[i], "*floatiness + (1|Site) + (1|year)")
+  model <- glmmTMB(as.formula(formula_str), offset = log(num_cleans), data = combined_data_test, family = nbinom2(link = "log"))
+  models[[i]] <- model
+}
+results <- model.sel(models, rank = "AICc")
+view(results) # Results showed that the model with a power transformation of 0.3 was best fit . Have kept the power level at 0.3 for the final model.
 ```
-## 2.3 Complete data cleaning, and run correlation test bewteen gravity and exposure.
+
+## 2.3 Prepare models and do correlation test
 ```{R}
-data_complete <- combined_data_test %>% dplyr::select(1:6, pw_3_exposure, geom) %>% rename(site_exposure = pw_3_exposure)
-levels_order <- c("Does Not Disperse", "Limited Dispersion", "Encumbered Drift", "Very Mobile", "Unencumbered Drift")
-data_complete$floatiness <- factor(data_complete$floatiness, levels = levels_order)
+exposure_lookup <- exposure_testing %>%
+  st_drop_geometry() %>%
+  dplyr::select(Sites, pw_3_exposure) %>%
+  distinct()
 
-#Melt high and low disperal categories together
-data_reduced <- data_complete %>% mutate(floatiness = case_when(floatiness %in% c("Does Not Disperse", "Limited Dispersion") ~ "Low dispersal capacity",
-                                                                floatiness %in% c("Encumbered Drift", "Very Mobile", "Unencumbered Drift") ~ "High dispersal capacity"))
-data_reduced <- data_reduced %>% group_by(Site, year, num_cleans, gravity, site_exposure, floatiness, geom) %>%
-                summarize(Totals = sum(Totals))
-levels_order <- c("Low dispersal capacity", "High dispersal capacity")
-data_reduced$floatiness <- factor(data_reduced$floatiness, levels = levels_order)
-#st_write(data_reduced, "outputs/clean_up_sites.gpkg")
-#Correlation test results
-forcortest <- data_complete %>% group_by(Site) %>%
-              summarize(gravity = first(gravity), exposure = first(site_exposure)) %>%
-              ungroup()
-cor.test(forcortest$gravity, forcortest$exposure)
-#Significant correlation, correlation -.21
+model_joined_raw <- debris_data %>%
+  left_join(
+    gravity_data,
+    by = c("Site" = "site_name")
+  ) %>%
+  left_join(
+    exposure_lookup,
+    by = c("Site" = "Sites")
+  ) %>%
+  rename(site_exposure = pw_3_exposure) %>%
+  transmute(
+    Site = as.character(Site),
+    year = as.character(year),
+    num_cleans = as.numeric(num_cleans),
+    Totals = as.numeric(Totals),
+    floatiness = as.character(floatiness),
+    gravity = as.numeric(gravity),
+    site_exposure = as.numeric(site_exposure)
+  )
 
-# Saving parameters for scaling
-parameters <- list()
- parameters[1] <- attr(data_reduced$site_exposure, "scaled:center")
- parameters[2] <- attr(data_reduced$site_exposure, "scaled:scale")
- parameters[3] <- attr(data_reduced$gravity, "scaled:center")
- parameters[4] <- attr(data_reduced$gravity, "scaled:scale")
-names(parameters) <- c("site_exposure_center", "site_exposure_scale", "gravity_center", "gravity_scale")
-saveRDS(parameters, "outputs/scaling_parameters.rds")
+debris_counts <- model_joined_raw %>%
+  group_by(
+    Site,
+    year,
+    floatiness
+  ) %>%
+  summarise(
+    Totals = sum(Totals),
+    .groups = "drop"
+  )
+site_year_covariates <- model_joined_raw %>%
+  group_by(
+    Site,
+    year
+  ) %>%
+  summarise(
+    num_cleans = first(num_cleans),
+    gravity = first(gravity),
+    site_exposure = first(site_exposure),
+    .groups = "drop"
+  )
+five_floatiness_levels <- c(
+  "Does Not Disperse",
+  "Limited Dispersion",
+  "Encumbered Drift",
+  "Very Mobile",
+  "Unencumbered Drift"
+)
+
+model_data_raw <- site_year_covariates %>%
+  tidyr::crossing(
+    floatiness = five_floatiness_levels
+  ) %>%
+  left_join(
+    debris_counts,
+    by = c(
+      "Site",
+      "year",
+      "floatiness"
+    )
+  ) %>%
+  mutate(
+    Totals = replace_na(Totals, 0),
+    floatiness = factor(
+      floatiness,
+      levels = five_floatiness_levels
+    )
+  )
+
+five_category_scaling_parameters <- list(
+  gravity_center = mean(
+    model_data_raw$gravity
+  ),
+  gravity_scale = sd(
+    model_data_raw$gravity
+  ),
+  site_exposure_center = mean(
+    model_data_raw$site_exposure
+  ),
+  site_exposure_scale = sd(
+    model_data_raw$site_exposure
+  ),
+  gravity_raw_min = min(
+    model_data_raw$gravity
+  ),
+  gravity_raw_max = max(
+    model_data_raw$gravity
+  ),
+  site_exposure_raw_min = min(
+    model_data_raw$site_exposure
+  ),
+  site_exposure_raw_max = max(
+    model_data_raw$site_exposure
+  )
+)
+five_category_scaling_parameters$gravity_min <-
+  five_category_scaling_parameters$gravity_raw_min
+
+five_category_scaling_parameters$gravity_max <-
+  five_category_scaling_parameters$gravity_raw_max
+
+five_category_scaling_parameters$site_exposure_min <-
+  five_category_scaling_parameters$site_exposure_raw_min
+
+five_category_scaling_parameters$site_exposure_max <-
+  five_category_scaling_parameters$site_exposure_raw_max
+
+# Standardise predictors for the final fitted model.
+
+data_complete <- model_data_raw %>%
+  mutate(
+    gravity = (
+      gravity -
+        five_category_scaling_parameters$gravity_center
+    ) /
+      five_category_scaling_parameters$gravity_scale,
+
+    site_exposure = (
+      site_exposure -
+        five_category_scaling_parameters$site_exposure_center
+    ) /
+      five_category_scaling_parameters$site_exposure_scale,
+
+    Site = factor(Site),
+    year = factor(year),
+
+    floatiness = factor(
+      floatiness,
+      levels = five_floatiness_levels
+    )
+  )
+
+five_category_scaling_parameters$gravity_scaled_min <-
+  min(data_complete$gravity)
+
+five_category_scaling_parameters$gravity_scaled_max <-
+  max(data_complete$gravity)
+
+five_category_scaling_parameters$site_exposure_scaled_min <-
+  min(data_complete$site_exposure)
+
+five_category_scaling_parameters$site_exposure_scaled_max <-
+  max(data_complete$site_exposure)
+
+saveRDS(
+  five_category_scaling_parameters,
+  "outputs/five_category_scaling_parameters.rds"
+)
+
+# Create the supplementary two-category dataset.
+# num_cleans is retained once and is not summed across categories.
+
+data_reduced <- data_complete %>%
+  mutate(
+    floatiness = case_when(
+      floatiness %in% c(
+        "Does Not Disperse",
+        "Limited Dispersion"
+      ) ~ "Low dispersal capacity",
+
+      TRUE ~ "High dispersal capacity"
+    )
+  ) %>%
+  group_by(
+    Site,
+    year,
+    num_cleans,
+    gravity,
+    site_exposure,
+    floatiness
+  ) %>%
+  summarise(
+    Totals = sum(Totals),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Site = factor(Site),
+    year = factor(year),
+
+    floatiness = factor(
+      floatiness,
+      levels = c(
+        "Low dispersal capacity",
+        "High dispersal capacity"
+      )
+    )
+  )
+
+# Correlation is calculated once per site using unscaled predictors.
+
+predictor_correlation_data <- model_data_raw %>%
+  group_by(Site) %>%
+  summarise(
+    gravity = first(gravity),
+    site_exposure = first(site_exposure),
+    .groups = "drop"
+  )
+
+predictor_correlation <- cor.test(
+  predictor_correlation_data$gravity,
+  predictor_correlation_data$site_exposure,
+  method = "spearman",
+  exact = FALSE
+)
+
+print(predictor_correlation) #p-value 0.3944 and rho -0.093 showing gravity and exposure are NOT correlated, so can be used together in the model.
 ```
 
 # 3. Produce violin plots for each floatiness category of debris data
@@ -173,135 +358,1079 @@ ggsave("plots/violin_plot_split.png", width = 10, height = 7, units = "in")
 
 # 4. Create predictive models
 ## 4.1 Fit models
-```{R}
+```{r}
 #Tried poisson distribution, but overdispersion was present so switched to negative binomial
 
-#Full model results (all categories)
-#Generate the model
-model_complete <- glmmTMB(Totals ~ gravity + site_exposure + floatiness + gravity*floatiness + site_exposure*floatiness + (1|Site) + (1|year),
-                                   offset = num_cleans,
-                                   data = data_complete,
-                                   family = nbinom2(link = "log"))
-#check for overdispersion
-deviance(model_complete) / df.residual(model_complete) # > 1
-car::Anova(model_complete, type = "III")
-summary(model_complete)
-saveRDS(model_complete, "outputs/full_model.rds")
-#write.csv(as.data.frame(summary(model_complete)[[6]][[1]]), "outputs/full_model_results(exposure power 0.3).csv")
 
-#Perform model selection
-  # options(na.action = "na.fail")
-  # mod_sel <- dredge(model_complete, trace = TRUE, rank = "AICc")
-  # print(mod_sel)
-  # write.csv(as.data.frame(mod_sel), "outputs/model_selection(no_adjustments)_results.csv")
+model_complete <- glmmTMB(
+  Totals ~
+    gravity * floatiness +
+    site_exposure * floatiness +
+    (1 | Site) +
+    (1 | year) +
+    offset(log(num_cleans)),
+  data = data_complete,
+  family = nbinom2(link = "log")
+)
 
-model_melted <- glmmTMB(Totals ~ gravity + site_exposure + floatiness + gravity*floatiness + site_exposure*floatiness + (1|Site) + (1|year),
-                        offset = num_cleans,
-                        data = data_reduced,
-                        family = nbinom2(link = "log"))
-#check for overdispersion
-deviance(model_melted) / df.residual(model_melted) # > 1
-car::Anova(model_melted, type = "III")
-summary(model_melted)
-saveRDS(model_melted, "outputs/melted_model.rds")
-write.csv(as.data.frame(summary(model_melted)[[6]][[1]]), "outputs/melted_model_results.csv")
-  options(na.action = "na.fail")
-  mod_sel <- dredge(model_melted, trace = TRUE, rank = "AICc")
-  print(mod_sel)
-  write.csv(as.data.frame(mod_sel), "outputs/model_selection(melted)_results.csv")
+print(summary(model_complete))
+
+type_III_tests <- car::Anova(
+  model_complete,
+  type = "III"
+)
+
+print(type_III_tests)
+
+
+#disperssal capacity, exposure, and interactions between exposure and gravity with diserpsal capacity all significant. Gravity alone was not significant, but the interaction with dispersal capacity was significant.
+model_five_category <- model_complete
+
+saveRDS(
+  model_five_category,
+  "outputs/five_category_model.rds"
+)
+
+#overall model coefficients and confidence intervals
+conditional_coefficient_table <- broom.mixed::tidy(
+  model_complete,
+  effects = "fixed",
+  component = "cond",
+  conf.int = TRUE,
+  conf.level = 0.95
+) |>
+  dplyr::mutate(
+    rate_ratio = exp(estimate),
+    rate_ratio_lower_95 = exp(conf.low),
+    rate_ratio_upper_95 = exp(conf.high)
+  ) |>
+  dplyr::select(
+    term,
+    estimate,
+    std.error,
+    statistic,
+    p.value,
+    conf.low,
+    conf.high,
+    rate_ratio,
+    rate_ratio_lower_95,
+    rate_ratio_upper_95
+  )
+
+print(conditional_coefficient_table)
+
+write.csv(
+  conditional_coefficient_table,
+  "outputs/full_model_conditional_coefficients_with_CI.csv",
+  row.names = FALSE
+)
+omnibus_tests <- car::Anova(
+  model_complete,
+  type = "III"
+) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("term")
+
+print(omnibus_tests)
+write.csv(
+  omnibus_tests,
+  "outputs/full_model_omnibus_tests.csv",
+  row.names = FALSE
+)
+
+type_III_table <- as.data.frame(
+  type_III_tests
+) %>%
+  tibble::rownames_to_column("term")
+
+write.csv(
+  type_III_table,
+  "outputs/five_category_type_III_tests.csv",
+  row.names = FALSE
+)
+
+
+model_melted <- glmmTMB(
+  Totals ~
+    gravity * floatiness +
+    site_exposure * floatiness +
+    (1 | Site) +
+    (1 | year) +
+    offset(log(num_cleans)),
+  data = data_reduced,
+  family = nbinom2(link = "log")
+)
+
+print(summary(model_melted))
+print(car::Anova(model_melted, type = "III"))
+
+saveRDS(
+  model_melted,
+  "outputs/melted_model.rds"
+)
+
+melted_coefficient_table <- as.data.frame(
+  summary(model_melted)$coefficients$cond
+) %>%
+  tibble::rownames_to_column("term")
+
+write.csv(
+  melted_coefficient_table,
+  "outputs/melted_model_results.csv",
+  row.names = FALSE
+)
 ```
-# 4.2 Test model robustness through k fold cross validation
-```{R}
-fit_model <- function(train_data) {
+# 4.2 five-fold site blocked cross validation
+```{r}
+#cross validation with cleaned unscaled data
+#scaling is recalculated within each fold to avoid data leakage
+cv_data <- model_data_raw %>%
+  ungroup() %>%
+  mutate(
+    Site = as.character(Site),
+    year = as.character(year),
+    num_cleans = as.numeric(num_cleans),
+    Totals = as.numeric(Totals),
+    gravity = as.numeric(gravity),
+    site_exposure = as.numeric(site_exposure),
+
+    floatiness = factor(
+      floatiness,
+      levels = five_floatiness_levels
+    )
+  )
+# Calculate observed site-level accumulation for stratified
+# allocation of complete sites to folds.
+
+site_summary <- cv_data %>%
+  group_by(Site, year) %>%
+  summarise(
+    observed_site_year = sum(Totals),
+    num_cleans = first(num_cleans),
+    .groups = "drop"
+  ) %>%
+  group_by(Site) %>%
+  summarise(
+    observed_total = sum(observed_site_year),
+    total_cleans = sum(num_cleans),
+    observed_per_clean = observed_total / total_cleans,
+    .groups = "drop"
+  )
+
+n_folds <- 5
+cv_seed <- 123
+
+set.seed(cv_seed)
+
+site_summary$fold <- caret::createFolds(
+  y = site_summary$observed_per_clean,
+  k = n_folds,
+  list = FALSE,
+  returnTrain = FALSE
+)
+
+cv_data <- cv_data %>%
+  left_join(
+    site_summary %>%
+      dplyr::select(Site, fold),
+    by = "Site"
+  )
+
+fold_assignment_check <- cv_data %>%
+  group_by(Site) %>%
+  summarise(
+    number_of_folds = n_distinct(fold),
+    .groups = "drop"
+  )
+
+if (any(fold_assignment_check$number_of_folds != 1)) {
+  stop("At least one site was assigned to more than one fold.")
+}
+
+print(
+  site_summary %>%
+    count(
+      fold,
+      name = "held_out_sites"
+    )
+)
+
+fit_cv_model <- function(train_data) {
+
   glmmTMB(
-    Totals ~ gravity + site_exposure + floatiness + gravity*floatiness + site_exposure*floatiness + (1|Site) + (1|year),
-    offset = num_cleans,
+    Totals ~
+      gravity * floatiness +
+      site_exposure * floatiness +
+      (1 | Site) +
+      (1 | year) +
+      offset(log(num_cleans)),
     data = train_data,
     family = nbinom2(link = "log")
   )
 }
 
-#Perform K-fold cross validation
-perform_kfold = function(k, data){
-folds <- createFolds(data$Totals, k = k, list = TRUE, returnTrain = TRUE)
-auc_values <- c()
-  for (i in 1:k) {
-    train_indices <- folds[[i]]
-    test_indices <- setdiff(1:nrow(data_reduced), train_indices)
-  
-    train_data <- data_reduced[train_indices, ]
-    test_data <- data_reduced[test_indices, ]
-  
-    model <- fit_model(train_data)
-  
-    # Predict on test data
-    predicted_probs <- predict(model, newdata = test_data, type = "response")
-    actual <- test_data$Totals
-  
-    # Calculate AUC
-    roc_curve <- multiclass.roc(actual, predicted_probs)
-    auc_value <- auc(roc_curve)
-    auc_values <- c(auc_values, auc_value)
+fold_predictions <- vector(
+  mode = "list",
+  length = n_folds
+)
+
+fold_diagnostics <- vector(
+  mode = "list",
+  length = n_folds
+)
+
+for (fold_number in seq_len(n_folds)) {
+
+  message(
+    "Fitting fold ",
+    fold_number,
+    " of ",
+    n_folds
+  )
+
+  train_data <- cv_data %>%
+    filter(fold != fold_number) %>%
+    dplyr::select(-fold)
+
+  test_data <- cv_data %>%
+    filter(fold == fold_number) %>%
+    dplyr::select(-fold)
+
+  # Calculate preprocessing parameters from the training fold only.
+
+  gravity_center <- mean(train_data$gravity)
+  gravity_scale <- sd(train_data$gravity)
+
+  exposure_center <- mean(
+    train_data$site_exposure
+  )
+
+  exposure_scale <- sd(
+    train_data$site_exposure
+  )
+
+  if (
+    !is.finite(gravity_scale) ||
+      gravity_scale <= 0 ||
+      !is.finite(exposure_scale) ||
+      exposure_scale <= 0
+  ) {
+    stop(
+      paste(
+        "A predictor has an invalid standard deviation",
+        "in fold",
+        fold_number
+      )
+    )
   }
-  return(auc_values)
+
+  train_data <- train_data %>%
+    mutate(
+      gravity = (
+        gravity - gravity_center
+      ) / gravity_scale,
+
+      site_exposure = (
+        site_exposure - exposure_center
+      ) / exposure_scale
+    )
+
+  test_data <- test_data %>%
+    mutate(
+      gravity = (
+        gravity - gravity_center
+      ) / gravity_scale,
+
+      site_exposure = (
+        site_exposure - exposure_center
+      ) / exposure_scale
+    )
+
+  # Preserve the observed year for later aggregation.
+
+  test_data$observed_year <- test_data$year
+
+  train_data <- train_data %>%
+    mutate(
+      Site = factor(Site),
+      year = factor(year),
+
+      floatiness = factor(
+        floatiness,
+        levels = five_floatiness_levels
+      )
+    )
+
+  # Fixed-effect predictions do not use the estimated year effect.
+  # A valid training-year factor level is nevertheless provided to
+  # avoid a new-level error during prediction.
+
+  reference_year <- levels(train_data$year)[1]
+
+  test_data <- test_data %>%
+    mutate(
+      Site = factor(Site),
+
+      year = factor(
+        reference_year,
+        levels = levels(train_data$year)
+      ),
+
+      floatiness = factor(
+        floatiness,
+        levels = five_floatiness_levels
+      )
+    )
+
+  fold_model <- fit_cv_model(
+    train_data
+  )
+
+  convergence_code <-
+    fold_model$fit$convergence
+
+  positive_definite_hessian <-
+    isTRUE(fold_model$sdr$pdHess)
+
+  if (convergence_code != 0) {
+    warning(
+      paste(
+        "Fold",
+        fold_number,
+        "returned convergence code",
+        convergence_code
+      )
+    )
+  }
+
+  if (!positive_definite_hessian) {
+    warning(
+      paste(
+        "Fold",
+        fold_number,
+        "did not return a positive-definite Hessian."
+      )
+    )
+  }
+
+  # re.form = NA excludes both site and year random effects.
+  # Predictions therefore represent previously unobserved sites.
+
+  test_data$predicted_total <- predict(
+    fold_model,
+    newdata = test_data,
+    type = "response",
+    re.form = NA,
+    allow.new.levels = TRUE
+  )
+
+  fold_predictions[[fold_number]] <- test_data %>%
+    transmute(
+      fold = fold_number,
+      Site = as.character(Site),
+      year = observed_year,
+      num_cleans,
+      floatiness,
+      observed_total = Totals,
+      predicted_total
+    )
+
+  fold_diagnostics[[fold_number]] <- data.frame(
+    fold = fold_number,
+    training_sites = n_distinct(train_data$Site),
+    held_out_sites = n_distinct(test_data$Site),
+    gravity_center,
+    gravity_scale,
+    exposure_center,
+    exposure_scale,
+    convergence_code,
+    positive_definite_hessian
+  )
 }
-#For K = 5
-set.seed(123)  # For reproducibility
-auc_values <- perform_kfold(5, data_reduced)
-mean_auc <- mean(auc_values)
-print(mean_auc) #0.9974931
 
-#For K = 10
-set.seed(123)  # For reproducibility
-auc_values <- perform_kfold(10, data_reduced)
-mean_auc <- mean(auc_values)
-print(mean_auc) #0.9992113
-#For K = 30
-set.seed(123)  # For reproducibility
-auc_values <- perform_kfold(30, data_reduced)
-mean_auc <- mean(auc_values)
-print(mean_auc) #0.9992063
+out_of_fold_rows <- bind_rows(
+  fold_predictions
+)
 
-#Leave one out cross validation
-set.seed(123)  # For reproducibility
-n <- nrow(data_reduced)  # Number of observations
-all_actual <- c()
-all_predicted_probs <- c()
+fold_diagnostics <- bind_rows(
+  fold_diagnostics
+)
 
-for (i in 1:n) {
-  test_indices <- i
-  train_indices <- setdiff(1:n, test_indices)
-  
-  train_data <- data_reduced[train_indices, ]
-  test_data <- data_reduced[test_indices, ]
-  
-  model <- fit_model(train_data)
-  
-  # Predict on test data
-  predicted_probs <- predict(model, newdata = test_data, type = "response")
-  actual <- test_data$Totals
-  
-  # Accumulate actual and predicted probabilities
-  all_actual <- c(all_actual, actual)
-  all_predicted_probs <- c(all_predicted_probs, predicted_probs)
+print(fold_diagnostics)
+
+if (
+  n_distinct(out_of_fold_rows$Site) !=
+    n_distinct(cv_data$Site)
+) {
+  stop("Not every site received an out-of-fold prediction.")
 }
-# Calculate AUC for multiclass
-roc_curve <- multiclass.roc(all_actual, all_predicted_probs)
-mean_auc <- auc(roc_curve)
-print(mean_auc) #0.9861
 
-# roc_list <- roc_curve$rocs
-# roc_plot_data <- data.frame()
-# for (i in 1:length(roc_list)) {
-#   roc_data <- roc_list[[i]]
-#   roc_df <- data.frame(
-#     tpr = rev(roc_data$sensitivities),
-#     fpr = rev(roc_data$specificities),
-#     class = as.factor(i)
-#   )
-#   roc_plot_data <- rbind(roc_plot_data, roc_df)
-# }
-# saveRDS(roc_plot_data, "outputs/roc_plot_data.rds")
+# Sum predictions across all five categories within each site-year.
+# num_cleans is retained only once per site-year.
+
+site_year_predictions <- out_of_fold_rows %>%
+  group_by(
+    fold,
+    Site,
+    year
+  ) %>%
+  summarise(
+    num_cleans = first(num_cleans),
+    n_effort_values = n_distinct(num_cleans),
+    n_categories = n_distinct(floatiness),
+    observed_total = sum(observed_total),
+    predicted_total = sum(predicted_total),
+    .groups = "drop"
+  )
+
+if (any(site_year_predictions$n_effort_values != 1)) {
+  stop("Effort is inconsistent in the held-out predictions.")
+}
+
+if (any(site_year_predictions$n_categories != 5)) {
+  stop("Some held-out site-years do not contain all five categories.")
+}
+
+# Produce one independent observed and predicted value per site.
+
+site_predictions <- site_year_predictions %>%
+  group_by(
+    fold,
+    Site
+  ) %>%
+  summarise(
+    years_observed = n_distinct(year),
+    total_cleans = sum(num_cleans),
+    observed_total = sum(observed_total),
+    predicted_total = sum(predicted_total),
+
+    observed_per_clean =
+      observed_total / total_cleans,
+
+    predicted_per_clean =
+      predicted_total / total_cleans,
+
+    .groups = "drop"
+  )
+
+if (anyDuplicated(site_predictions$Site)) {
+  stop("At least one site occurs more than once in site_predictions.")
+}
+
+# Overall pooled rank agreement.
+
+spearman_rho <- cor(
+  site_predictions$observed_per_clean,
+  site_predictions$predicted_per_clean,
+  method = "spearman"
+)
+
+# Independently classify observed and predicted values using
+# their 33.3% and 66.7% quantiles.
+
+observed_terciles <- quantile(
+  site_predictions$observed_per_clean,
+  probs = c(1 / 3, 2 / 3),
+  type = 7,
+  names = FALSE
+)
+
+predicted_terciles <- quantile(
+  site_predictions$predicted_per_clean,
+  probs = c(1 / 3, 2 / 3),
+  type = 7,
+  names = FALSE
+)
+
+tercile_thresholds <- data.frame(
+  value_type = c(
+    "Observed",
+    "Predicted"
+  ),
+
+  low_medium_threshold = c(
+    observed_terciles[1],
+    predicted_terciles[1]
+  ),
+
+  medium_high_threshold = c(
+    observed_terciles[2],
+    predicted_terciles[2]
+  )
+)
+
+classify_tercile <- function(x, breaks) {
+
+  case_when(
+    x <= breaks[1] ~ "Low",
+    x <= breaks[2] ~ "Medium",
+    TRUE ~ "High"
+  )
+}
+
+site_predictions <- site_predictions %>%
+  mutate(
+    observed_class = factor(
+      classify_tercile(
+        observed_per_clean,
+        observed_terciles
+      ),
+      levels = c(
+        "Low",
+        "Medium",
+        "High"
+      ),
+      ordered = TRUE
+    ),
+
+    predicted_class = factor(
+      classify_tercile(
+        predicted_per_clean,
+        predicted_terciles
+      ),
+      levels = c(
+        "Low",
+        "Medium",
+        "High"
+      ),
+      ordered = TRUE
+    ),
+
+    observed_class_number =
+      as.integer(observed_class),
+
+    predicted_class_number =
+      as.integer(predicted_class)
+  )
+
+# Rows are observed classes; columns are predicted classes.
+
+tercile_confusion_matrix <- table(
+  Observed = site_predictions$observed_class,
+  Predicted = site_predictions$predicted_class
+)
+
+print(tercile_confusion_matrix)
+
+tercile_confusion_table <-
+  as.data.frame.matrix(
+    tercile_confusion_matrix
+  ) %>%
+  tibble::rownames_to_column("Observed")
+
+observed_high <-
+  site_predictions$observed_class == "High"
+
+predicted_high <-
+  site_predictions$predicted_class == "High"
+
+true_positive_high <- sum(
+  observed_high & predicted_high
+)
+
+high_precision <- if (sum(predicted_high) > 0) {
+  true_positive_high / sum(predicted_high)
+} else {
+  NA_real_
+}
+
+high_recall <- if (sum(observed_high) > 0) {
+  true_positive_high / sum(observed_high)
+} else {
+  NA_real_
+}
+
+high_medium_or_high_recall <- if (
+  sum(observed_high) > 0
+) {
+  mean(
+    site_predictions$predicted_class[
+      observed_high
+    ] %in% c("Medium", "High")
+  )
+} else {
+  NA_real_
+}
+
+exact_tercile_accuracy <- mean(
+  site_predictions$observed_class_number ==
+    site_predictions$predicted_class_number
+)
+
+within_one_tercile_accuracy <- mean(
+  abs(
+    site_predictions$observed_class_number -
+      site_predictions$predicted_class_number
+  ) <= 1
+)
+
+opposite_tercile_error <- mean(
+  abs(
+    site_predictions$observed_class_number -
+      site_predictions$predicted_class_number
+  ) == 2
+)
+
+classification_metrics <- data.frame(
+  metric = c(
+    "Number of held-out sites",
+    "Spearman rank correlation",
+    "Observed high-accumulation sites",
+    "Predicted high-accumulation sites",
+    "Correctly identified high-accumulation sites",
+    "High-tercile precision",
+    "High-tercile recall",
+    "Observed-high predicted Medium or High",
+    "Exact tercile accuracy",
+    "Accuracy within one tercile",
+    "Opposite-tercile error rate"
+  ),
+
+  value = c(
+    nrow(site_predictions),
+    spearman_rho,
+    sum(observed_high),
+    sum(predicted_high),
+    true_positive_high,
+    high_precision,
+    high_recall,
+    high_medium_or_high_recall,
+    exact_tercile_accuracy,
+    within_one_tercile_accuracy,
+    opposite_tercile_error
+  )
+)
+
+print(classification_metrics)
+
+# Fold-specific performance.
+#
+# The pooled tercile thresholds above are retained across folds.
+# Thresholds are not recalculated independently within each fold.
+
+fold_metrics <- site_predictions %>%
+  group_by(fold) %>%
+  summarise(
+    held_out_sites = n(),
+
+    spearman_rho = suppressWarnings(
+      cor(
+        observed_per_clean,
+        predicted_per_clean,
+        method = "spearman"
+      )
+    ),
+
+    exact_tercile_accuracy = mean(
+      observed_class_number ==
+        predicted_class_number
+    ),
+
+    within_one_tercile_accuracy = mean(
+      abs(
+        observed_class_number -
+          predicted_class_number
+      ) <= 1
+    ),
+
+    observed_high_sites = sum(
+      observed_class == "High"
+    ),
+
+    observed_high_predicted_high = if (
+      sum(observed_class == "High") > 0
+    ) {
+      mean(
+        predicted_class[
+          observed_class == "High"
+        ] == "High"
+      )
+    } else {
+      NA_real_
+    },
+
+    observed_high_predicted_medium_or_high = if (
+      sum(observed_class == "High") > 0
+    ) {
+      mean(
+        predicted_class[
+          observed_class == "High"
+        ] %in% c("Medium", "High")
+      )
+    } else {
+      NA_real_
+    },
+
+    .groups = "drop"
+  )
+
+fold_variability <- fold_metrics %>%
+  summarise(
+    mean_spearman_rho =
+      mean(spearman_rho, na.rm = TRUE),
+
+    sd_spearman_rho =
+      sd(spearman_rho, na.rm = TRUE),
+
+    minimum_spearman_rho =
+      min(spearman_rho, na.rm = TRUE),
+
+    maximum_spearman_rho =
+      max(spearman_rho, na.rm = TRUE),
+
+    mean_exact_tercile_accuracy =
+      mean(
+        exact_tercile_accuracy,
+        na.rm = TRUE
+      ),
+
+    sd_exact_tercile_accuracy =
+      sd(
+        exact_tercile_accuracy,
+        na.rm = TRUE
+      ),
+
+    mean_within_one_tercile_accuracy =
+      mean(
+        within_one_tercile_accuracy,
+        na.rm = TRUE
+      ),
+
+    sd_within_one_tercile_accuracy =
+      sd(
+        within_one_tercile_accuracy,
+        na.rm = TRUE
+      ),
+
+    mean_observed_high_predicted_high =
+      mean(
+        observed_high_predicted_high,
+        na.rm = TRUE
+      ),
+
+    sd_observed_high_predicted_high =
+      sd(
+        observed_high_predicted_high,
+        na.rm = TRUE
+      ),
+
+    mean_observed_high_predicted_medium_or_high =
+      mean(
+        observed_high_predicted_medium_or_high,
+        na.rm = TRUE
+      ),
+
+    sd_observed_high_predicted_medium_or_high =
+      sd(
+        observed_high_predicted_medium_or_high,
+        na.rm = TRUE
+      )
+  )
+
+print(fold_metrics)
+print(fold_variability)
+
+# Bootstrap uncertainty by resampling held-out sites.
+
+validation_bootstrap <- function(data, indices) {
+
+  sampled_data <- data[indices, ]
+
+  sampled_observed_high <-
+    sampled_data$observed_class == "High"
+
+  sampled_predicted_high <-
+    sampled_data$predicted_class == "High"
+
+  sampled_true_positive <- sum(
+    sampled_observed_high &
+      sampled_predicted_high
+  )
+
+  sampled_precision <- if (
+    sum(sampled_predicted_high) > 0
+  ) {
+    sampled_true_positive /
+      sum(sampled_predicted_high)
+  } else {
+    NA_real_
+  }
+
+  sampled_recall <- if (
+    sum(sampled_observed_high) > 0
+  ) {
+    sampled_true_positive /
+      sum(sampled_observed_high)
+  } else {
+    NA_real_
+  }
+
+  sampled_medium_or_high_recall <- if (
+    sum(sampled_observed_high) > 0
+  ) {
+    mean(
+      sampled_data$predicted_class[
+        sampled_observed_high
+      ] %in% c("Medium", "High")
+    )
+  } else {
+    NA_real_
+  }
+
+  c(
+    spearman_rho = suppressWarnings(
+      cor(
+        sampled_data$observed_per_clean,
+        sampled_data$predicted_per_clean,
+        method = "spearman"
+      )
+    ),
+
+    high_precision = sampled_precision,
+
+    high_recall = sampled_recall,
+
+    high_medium_or_high_recall =
+      sampled_medium_or_high_recall,
+
+    exact_tercile_accuracy = mean(
+      sampled_data$observed_class_number ==
+        sampled_data$predicted_class_number
+    ),
+
+    within_one_tercile_accuracy = mean(
+      abs(
+        sampled_data$observed_class_number -
+          sampled_data$predicted_class_number
+      ) <= 1
+    )
+  )
+}
+
+set.seed(cv_seed)
+
+bootstrap_results <- boot::boot(
+  data = site_predictions,
+  statistic = validation_bootstrap,
+  R = 2000
+)
+
+bootstrap_metric_names <- c(
+  "Spearman rank correlation",
+  "High-tercile precision",
+  "High-tercile recall",
+  "Observed-high predicted Medium or High",
+  "Exact tercile accuracy",
+  "Accuracy within one tercile"
+)
+
+confidence_intervals <- purrr::map_dfr(
+  seq_along(bootstrap_metric_names),
+  function(metric_number) {
+
+    interval <- boot::boot.ci(
+      bootstrap_results,
+      type = "perc",
+      index = metric_number
+    )
+
+    if (is.null(interval$percent)) {
+
+      lower_limit <- NA_real_
+      upper_limit <- NA_real_
+
+    } else {
+
+      lower_limit <- interval$percent[4]
+      upper_limit <- interval$percent[5]
+    }
+
+    tibble(
+      metric =
+        bootstrap_metric_names[metric_number],
+
+      estimate =
+        bootstrap_results$t0[metric_number],
+
+      lower_95 = lower_limit,
+      upper_95 = upper_limit
+    )
+  }
+)
+
+print(confidence_intervals)
+
+# Explicitly evaluate the former top- and bottom-ten claim.
+
+observed_top_10 <- site_predictions %>%
+  arrange(
+    desc(observed_per_clean),
+    Site
+  ) %>%
+  slice_head(n = 10) %>%
+  pull(Site)
+
+predicted_top_10 <- site_predictions %>%
+  arrange(
+    desc(predicted_per_clean),
+    Site
+  ) %>%
+  slice_head(n = 10) %>%
+  pull(Site)
+
+observed_bottom_10 <- site_predictions %>%
+  arrange(
+    observed_per_clean,
+    Site
+  ) %>%
+  slice_head(n = 10) %>%
+  pull(Site)
+
+predicted_bottom_10 <- site_predictions %>%
+  arrange(
+    predicted_per_clean,
+    Site
+  ) %>%
+  slice_head(n = 10) %>%
+  pull(Site)
+
+extreme_rank_summary <- data.frame(
+  metric = c(
+    "Observed top 10 also in predicted top 10",
+    "Observed bottom 10 also in predicted bottom 10",
+    "Observed top 10 assigned to predicted High",
+    "Observed bottom 10 assigned to predicted Low"
+  ),
+
+  value = c(
+    length(
+      intersect(
+        observed_top_10,
+        predicted_top_10
+      )
+    ),
+
+    length(
+      intersect(
+        observed_bottom_10,
+        predicted_bottom_10
+      )
+    ),
+
+    sum(
+      site_predictions$Site %in%
+        observed_top_10 &
+        site_predictions$predicted_class ==
+          "High"
+    ),
+
+    sum(
+      site_predictions$Site %in%
+        observed_bottom_10 &
+        site_predictions$predicted_class ==
+          "Low"
+    )
+  )
+)
+
+extreme_rank_sites <- site_predictions %>%
+  mutate(
+    observed_extreme_group = case_when(
+      Site %in% observed_top_10 ~
+        "Observed top 10",
+
+      Site %in% observed_bottom_10 ~
+        "Observed bottom 10",
+
+      TRUE ~ NA_character_
+    ),
+
+    observed_rank =
+      min_rank(desc(observed_per_clean)),
+
+    predicted_rank =
+      min_rank(desc(predicted_per_clean))
+  ) %>%
+  filter(
+    !is.na(observed_extreme_group)
+  ) %>%
+  arrange(observed_rank)
+
+print(extreme_rank_summary)
+
+# Save validation outputs.
+
+write.csv(
+  out_of_fold_rows,
+  "outputs/cross_validation_row_predictions5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  site_year_predictions,
+  "outputs/cross_validation_site_year_predictions5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  site_predictions,
+  "outputs/cross_validation_site_predictions5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  fold_diagnostics,
+  "outputs/cross_validation_fold_diagnostics5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  fold_metrics,
+  "outputs/cross_validation_fold_metrics5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  fold_variability,
+  "outputs/cross_validation_fold_variability5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  tercile_confusion_table,
+  "outputs/cross_validation_tercile_confusion_matrix5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  tercile_thresholds,
+  "outputs/cross_validation_tercile_thresholds5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  classification_metrics,
+  "outputs/cross_validation_classification_metrics5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  confidence_intervals,
+  "outputs/cross_validation_confidence_intervals5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  extreme_rank_summary,
+  "outputs/cross_validation_extreme_rank_summary5.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  extreme_rank_sites,
+  "outputs/cross_validation_extreme_rank_sites5.csv",
+  row.names = FALSE
+)
 
 ```
 # 4.3 Plot model results
@@ -427,8 +1556,27 @@ data_low_disp <- data_complete %>%
                   group_by(Site, year, floatiness) %>%
                   summarize(gravity = first(gravity), exposure = first(site_exposure), Totals = sum(Totals), num_cleans = first(num_cleans)) %>%
                   ungroup()
-Cmodel_lowdis_cmp <- glmmTMB(Totals ~ gravity *floatiness + exposure*floatiness + (1|Site) + (1|year), offset = num_cleans, data = data_low_disp, family = nbinom2(link = "log"))
-Cmodel_highdis_cmp <- glmmTMB(Totals ~   exposure * floatiness + gravity*floatiness+ (1|Site) + (1|year), offset = num_cleans, data = data_high_disp, family = nbinom2(link = "log"))
+Cmodel_lowdis_cmp <- glmmTMB(
+  Totals ~
+    gravity * floatiness +
+    exposure * floatiness +
+    (1 | Site) +
+    (1 | year) +
+    offset(log(num_cleans)),
+  data = data_low_disp,
+  family = nbinom2(link = "log")
+)
+
+Cmodel_highdis_cmp <- glmmTMB(
+  Totals ~
+    exposure * floatiness +
+    gravity * floatiness +
+    (1 | Site) +
+    (1 | year) +
+    offset(log(num_cleans)),
+  data = data_high_disp,
+  family = nbinom2(link = "log")
+)
 car::Anova(Cmodel_lowdis_cmp)
 car::Anova(Cmodel_highdis_cmp)
 summary(Cmodel_lowdis_cmp)
