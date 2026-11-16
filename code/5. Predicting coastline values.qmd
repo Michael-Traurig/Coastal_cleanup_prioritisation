@@ -1,7 +1,7 @@
 ---
 Authors: Michael Joel Traurig, Kay Critchell
 Title: Applying predictive model across Whitsundsays region for Coastal clean-up prioritisation with open-access, data-lean models informs better decisions
-Version: 0.9 (Submission of manuscript)
+Version: 1.0 (Publication version)
 ---
 
 # 1. Load libraries and functions
@@ -14,7 +14,7 @@ Here we create points along the coastline and islands to calculate gravity and e
 # 2. Model coastline
 ```{R}
 e <- ext(148.00916, 149.34895, -21.34380, -19.90391)
-coastline <- vect("data/coast_nobuff.shp") %>% crop(e) %>% project(exposure_data) %>% st_as_sf()
+coastline <- vect("data/coast_nobuff.shp") %>% crop(e) %>% project('epsg:32755') %>% st_as_sf() %>% st_cast("LINESTRING")
 
 point_distance <- 500
 create_regular_points <- function(line, distance) {
@@ -140,7 +140,7 @@ for (i in 1:nrow(ports_reduced)) {
 }
 names(rasters) <- ports_reduced$Site
 write_rds(rasters, "outputs/ldcp_templist.rds")
-rasters <- read_RDS("C:/Users/traurigm/Desktop/ldcp_templist.rds")
+rasters <- read_RDS("outputs/ldcp_templist.rds")
 stack <- terra::rast(rasters)
 writeRaster(stack, "data/land_distance_stack_coastpoints.tif", overwrite = TRUE)
 
@@ -216,31 +216,80 @@ exposure_data <- left_join(beaches_exposed, wind_summarized, by = c("directions"
 				 summarize(site_exposure = sum(line_exposure))
 
 beaches_linked$exposure <- exposure_data$site_exposure
+model_five_category <- readRDS(
+  "outputs/five_category_model.rds"
+)
+
+five_category_scaling_parameters <- readRDS(
+  "outputs/five_category_scaling_parameters.rds"
+)
+
+number_before_filtering <- nrow(
+  beaches_linked
+)
 coastaldata <- beaches_linked %>% filter(exposure < 959 & exposure > 85) #Max range of exposure (after power transformation) was 958.55076 and min range was 85.71388
-scaling_parameters <- readRDS("outputs/scaling_parameters.rds")
-coastaldata$gravity <- scale(coastaldata$gravity, center = scaling_parameters$gravity_center, scale = scaling_parameters$gravity_scale)
-coastaldata$exposure <- scale(coastaldata$exposure, center = scaling_parameters$site_exposure_center, scale = scaling_parameters$site_exposure_scale)
+coastaldata <- coastaldata %>% filter(gravity < 53 & gravity > 2) # Max range of gravity from model was 52.1992
 
-#Predict debris
-complete_model <- readRDS("outputs/full_model.rds")
-melted_model <- readRDS("outputs/melted_model.rds")
+message(
+  number_before_filtering -
+    nrow(coastaldata),
+  " coastline locations were excluded because one or more ",
+  "predictors fell outside the training-data range."
+)
+#174 locations removed
+# coastaldata <- coastaldata %>%
+#   mutate(
+#     gravity = scale(gravity, center = five_category_scaling_parameters$gravity_center, scale = five_category_scaling_parameters$gravity_scale),
+#     site_exposure = scale(exposure, center = five_category_scaling_parameters$site_exposure_center, scale = five_category_scaling_parameters$site_exposure_scale)
+#   )
+coastaldata <- coastaldata %>% rename("site_exposure" = "exposure")
+coastaldata$gravity <- scale(coastaldata$gravity, center = five_category_scaling_parameters$gravity_center, scale = five_category_scaling_parameters$gravity_scale)
+coastaldata$site_exposure <- scale(coastaldata$site_exposure, center = five_category_scaling_parameters$site_exposure_center, scale = five_category_scaling_parameters$site_exposure_scale)
 
-#Predict debris using the melted_model
-predict_high <- coastaldata %>% dplyr::select(Site, gravity, exposure, -geom) %>% as.data.frame() %>%  
-                mutate(floatiness = "High dispersal") %>%
-                rename(site_exposure = exposure) %>%
-                mutate(num_cleans = 1) %>%
-                mutate(year = "2022")
-predict_low <- coastaldata %>% dplyr::select(Site, gravity, exposure, -geom) %>% as.data.frame() %>%
-                mutate(floatiness = "Low dispersal") %>%
-                rename(site_exposure = exposure) %>%
-                mutate(num_cleans = 1) %>%
-                mutate(year = "2022")
+coastline_predictions <-
+  predict_five_category_debris(
+    new_data = coastaldata,
+    fitted_model = model_five_category,
+    scaling_parameters =
+      five_category_scaling_parameters
+  )
+coastaldata <- coastaldata %>%
+  left_join(
+    coastline_predictions$totals,
+    by = "Site"
+  )
+st_write(
+  coastaldata,
+  "outputs/coastal_with_predicted_debris.gpkg",
+  delete_dsn = TRUE
+)
 
-predictions_high <- predict(melted_model, newdata = predict_high, type = "response")
-predictions_low <- predict(melted_model, newdata = predict_low, type = "response")
-coastaldata$debris <- predictions_high + predictions_low
-st_write(coastaldata, "outputs/coastal_with_predicted_debris.gpkg")
+write.csv(
+  coastline_predictions$categories,
+  "outputs/coastline_predictions_by_debris_category.csv",
+  row.names = FALSE
+)
+
+# #Predict debris
+# complete_model <- readRDS("outputs/full_model.rds")
+# melted_model <- readRDS("outputs/melted_model.rds")
+
+# #Predict debris using the melted_model
+# predict_high <- coastaldata %>% dplyr::select(Site, gravity, exposure, -geom) %>% as.data.frame() %>%  
+#                 mutate(floatiness = "High dispersal") %>%
+#                 rename(site_exposure = exposure) %>%
+#                 mutate(num_cleans = 1) %>%
+#                 mutate(year = "2022")
+# predict_low <- coastaldata %>% dplyr::select(Site, gravity, exposure, -geom) %>% as.data.frame() %>%
+#                 mutate(floatiness = "Low dispersal") %>%
+#                 rename(site_exposure = exposure) %>%
+#                 mutate(num_cleans = 1) %>%
+#                 mutate(year = "2022")
+
+# predictions_high <- predict(melted_model, newdata = predict_high, type = "response")
+# predictions_low <- predict(melted_model, newdata = predict_low, type = "response")
+# coastaldata$debris <- predictions_high + predictions_low
+# st_write(coastaldata, "outputs/coastal_with_predicted_debris.gpkg")
 ```
 # 6. Assessment of ecobarg cleanups
 Here we use the predicted debris values across the coastline to assess the current prioritisation of clean ups, and identify high priority sites for future clean ups. We do this in two ways, first by assigning each clean up to the nearest point on the coastline and using the predicted debris value for that point, and second by predicting debris values for the clean up sites themselves using their gravity and exposure values.
@@ -251,27 +300,36 @@ gravity_data <- read.csv("outputs/gravity_final.csv") %>%
                 dplyr::select(site_name, gravity)
 exposure_data <- st_read("outputs/exposure_data_testing.gpkg") %>% dplyr::select(Sites, pw_3_exposure) %>% rename(site_exposure = pw_3_exposure) %>% st_drop_geometry()
 clean_ups <- left_join(exposure_data, gravity_data, by = c("Sites" = "site_name")) %>% rename(Site = Sites)
-scaling_parameters <- readRDS("outputs/scaling_parameters.rds")
+scaling_parameters <- readRDS("outputs/five_category_scaling_parameters.rds")
 clean_ups$gravity <- scale(clean_ups$gravity, center = scaling_parameters$gravity_center, scale = scaling_parameters$gravity_scale)
 clean_ups$site_exposure <- scale(clean_ups$site_exposure, center = scaling_parameters$site_exposure_center, scale = scaling_parameters$site_exposure_scale)
-predict_high <- clean_ups %>% dplyr::select(Site, gravity, site_exposure) %>% as.data.frame() %>%  
-                mutate(floatiness = "High dispersal capacity") %>%
-                mutate(num_cleans = 1) %>%
-                mutate(year = "2022")
-predict_low <- clean_ups %>% dplyr::select(Site, gravity, site_exposure) %>% as.data.frame() %>%
-                mutate(floatiness = "Low dispersal capacity") %>%
-                mutate(num_cleans = 1) %>%
-                mutate(year = "2022")
-melted_model <- readRDS("outputs/melted_model.rds")
-predictions_high <- predict(melted_model, newdata = predict_high, type = "response")
-predictions_low <- predict(melted_model, newdata = predict_low, type = "response")
-clean_ups$debris <- predictions_high + predictions_low
+##Predict debris using 5 category model
+coastline_predictions <-
+  predict_five_category_debris(
+    new_data = clean_ups,
+    fitted_model = model_five_category,
+    scaling_parameters =
+      five_category_scaling_parameters
+  )
 
+# predict_high <- clean_ups %>% dplyr::select(Site, gravity, site_exposure) %>% as.data.frame() %>%  
+#                 mutate(floatiness = "High dispersal capacity") %>%
+#                 mutate(num_cleans = 1) %>%
+#                 mutate(year = "2022")
+# predict_low <- clean_ups %>% dplyr::select(Site, gravity, site_exposure) %>% as.data.frame() %>%
+#                 mutate(floatiness = "Low dispersal capacity") %>%
+#                 mutate(num_cleans = 1) %>%
+#                 mutate(year = "2022")
+# melted_model <- readRDS("outputs/melted_model.rds")
+# predictions_high <- predict(melted_model, newdata = predict_high, type = "response")
+# predictions_low <- predict(melted_model, newdata = predict_low, type = "response")
+# clean_ups$debris <- predictions_high + predictions_low
+clean_ups$debris <- coastline_predictions$totals$debris
 site_data <- st_read("data/beaches_linked.gpkg") %>% dplyr::select(Site, geom) %>% filter(Site %in% clean_ups$Site)
 site_data$debris <- clean_ups$debris
 site_data$gravity <- clean_ups$gravity
 site_data$site_exposure <- clean_ups$site_exposure
-st_write(site_data, "outputs/clean_ups with predictions.gpkg")
+st_write(site_data, "outputs/clean_ups with predictions_updated.gpkg")
 
 # Step 1: Calculate Quartiles for gravity and debris
 terciles_gravity <- quantile(coastaldata$gravity, probs = c(1/3, 2/3))
@@ -302,14 +360,14 @@ coastaldata <- coastaldata %>%
 
 # Step 4: Assess the currenty prioritisation of clean ups
 #Scenario 1: Nearest point to clean up
-nearest_indices <- st_nearest_feature(clean_ups, coastaldata)
-clean_ups$combined_category <- coastaldata$combined_category[nearest_indices]
-clean_ups$gravity_category <- coastaldata$gravity_category[nearest_indices]
-clean_ups$debris_category <- coastaldata$debris_category[nearest_indices]
-clean_ups$gravity <- coastaldata$gravity[nearest_indices]
-clean_ups$debris <- coastaldata$debris[nearest_indices]
-table(clean_ups$combined_category)
-st_write(clean_ups, "outputs/clean_ups_assessment.gpkg")
+nearest_indices <- st_nearest_feature(site_data, coastaldata)
+site_data$combined_category <- coastaldata$combined_category[nearest_indices]
+site_data$gravity_category <- coastaldata$gravity_category[nearest_indices]
+site_data$debris_category <- coastaldata$debris_category[nearest_indices]
+site_data$gravity <- coastaldata$gravity[nearest_indices]
+site_data$debris <- coastaldata$debris[nearest_indices]
+table(site_data$combined_category)
+st_write(site_data, "outputs/clean_ups_assessment_updated2.gpkg")
 #Scenario 2: Predicting amongst sites themselves
 clean_ups <- st_read("outputs/clean_ups with predictions.gpkg")
 clean_ups <- clean_ups %>%
@@ -321,13 +379,11 @@ clean_ups <- clean_ups %>%
     combined_category = paste(gravity_category, debris_category, sep = "_")
   )
 table(clean_ups$combined_category)
-st_write(clean_ups, "outputs/clean_ups_assessment2.gpkg")
+st_write(clean_ups, "outputs/clean_ups_assessment3.gpkg")
 
 
 coastaldata %>% filter(combined_category %in% c("High_High", "High_Medium", "Medium_High")) %>%
-st_write("outputs/high_priority_sites.gpkg")
-library(mapview)
-mapview(temp, zcol = "combined_category") + mapview(clean_ups, color = "blue")
+st_write("outputs/high_priority_sites2.gpkg")
 ```
 # 7. Validate gravity through external dataset
 ```{R}
@@ -344,8 +400,31 @@ for(i in 1:nrow(beaches)){
   beaches$reef_vis[i] <- mean(terra::extract(visit_r, beach)$tourism_rast, na.rm = TRUE)
 }
 beach_cor <- filter(beaches, !is.na(reef_vis))
-cor.test(beach_cor$reef_vis, beach_cor$Gravity, method = "pearson")
+cor.test(beach_cor$reef_vis, beach_cor$Gravity, method = "spearman")
 
+spearman_boot <- function(data, indices) {
+  sampled_data <- data[indices, ]
+
+  cor(
+    sampled_data$reef_vis,
+    sampled_data$Gravity,
+    method = "spearman",
+    use = "complete.obs"
+  )
+}
+
+set.seed(123)
+
+visitation_bootstrap <- boot::boot(
+  data = sf::st_drop_geometry(beach_cor),
+  statistic = spearman_boot,
+  R = 2000
+)
+
+boot::boot.ci(
+  visitation_bootstrap,
+  type = "perc"
+)
 
 visit_r <- rast("data/tourism_value.tif") %>% crop(beaches) #visitation value
 rcl <- matrix(c(65535, NA), ncol = 2, byrow = TRUE)
@@ -355,20 +434,17 @@ for(i in 1:nrow(beaches)){
   beaches$reef_vis[i] <- mean(terra::extract(visit_r, beach)$tourism_value, na.rm = TRUE)
 }
 beach_cor <- filter(beaches, !is.na(reef_vis))
-cor.test(beach_cor$reef_vis, beach_cor$Gravity, method = "pearson")
+cor.test(beach_cor$reef_vis, beach_cor$Gravity, method = "spearman")
+set.seed(123)
 
-#reef_visitor <- st_read("outputs/adjacent visitors clipped.shp") %>% st_transform(32755)
-#reef_visitor <- st_read("data/reef_adjacent_value.shp") %>% st_transform(st_crs(beaches))
-# for(i in 1:nrow(beaches)){
-#   beach <- beaches[i,]
-#   reef_data <- st_intersection(beach, reef_visitor)
-#   if(nrow(reef_data) > 0){
-#   beaches$reef_vis[i] <- reef_data$Total_val 
-#   } else {
-#   beaches$reef_vis[i] <- NA
-#   }
-# }
-# beach_cor <- filter(beaches, !is.na(reef_vis))
-# cor.test(beach_cor$reef_vis, beach_cor$Gravity, method = "pearson")
+visitation_bootstrap <- boot::boot(
+  data = sf::st_drop_geometry(beach_cor),
+  statistic = spearman_boot,
+  R = 2000
+)
+
+boot::boot.ci(
+  visitation_bootstrap,
+  type = "perc"
+)
 ```
-
